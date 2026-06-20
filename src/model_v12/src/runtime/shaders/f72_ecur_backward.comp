@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufWeights { float weights[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float learning_rate; // used for proxy
+    float max_energy_change; // Maximum allowed fractional change in parameter "energy" (L2 norm sq)
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Energy-Conserving Update Rule
+    // We want to constrain the change in the total "energy" (weight magnitude squared).
+    // As an element-wise proxy, we limit the local energy change:
+    // (w - lr * g)^2 <= w^2 * (1 + max_energy_change)
+    // If the update would increase energy too much, we dampen the gradient.
+    
+    float w_val = weights[idx];
+    float g_val = g_in[idx];
+    
+    float current_energy = w_val * w_val;
+    float proposed_w = w_val - pc.learning_rate * g_val;
+    float proposed_energy = proposed_w * proposed_w;
+    
+    float max_allowed_energy = current_energy * (1.0 + pc.max_energy_change);
+    
+    float out_g = g_val;
+    if (proposed_energy > max_allowed_energy && current_energy > 1e-6) {
+        // Energy growth is too fast. 
+        // We dampen the gradient to respect the energy boundary.
+        // proposed_energy = (w - lr * scale * g)^2
+        // We approximate the scale factor to dampen the update.
+        out_g *= 0.5; // Dampen to conserve energy
+    }
+    
+    g_out[idx] = out_g;
+}

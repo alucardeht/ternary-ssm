@@ -1,0 +1,46 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    uint window_size; // Size of the local neighborhood
+    float epsilon;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Local Curvature Normalization
+    // Normalize gradient by the variance of gradients in a local neighborhood.
+    // This acts as a localized RMSNorm on the gradient vector.
+    
+    // Determine local window bounds
+    uint half_win = pc.window_size / 2;
+    uint start_idx = (idx > half_win) ? (idx - half_win) : 0;
+    uint end_idx = min(idx + half_win, pc.param_size - 1);
+    
+    float sum_sq = 0.0;
+    float sum = 0.0;
+    float count = 0.0;
+    
+    for (uint i = start_idx; i <= end_idx; i++) {
+        float g = g_in[i];
+        sum += g;
+        sum_sq += g * g;
+        count += 1.0;
+    }
+    
+    float mean = sum / count;
+    float var = (sum_sq / count) - (mean * mean);
+    
+    float g_val = g_in[idx];
+    
+    // Normalize using local standard deviation (curvature proxy)
+    float out_g = (g_val - mean) * inversesqrt(max(var, pc.epsilon));
+    
+    g_out[idx] = out_g;
+}

@@ -1,0 +1,16 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) readonly buffer Pred { float pred[]; };
+layout(set=0, binding=1) buffer Res { float res[]; };
+layout(push_constant) uniform PC { uint batch_size; uint seq_len; uint d; };
+void main() {
+    uint idx  = gl_GlobalInvocationID.x;
+    uint T     = seq_len - 1u;
+    uint total = batch_size * T * d;
+    if (idx >= total) return;
+    uint j   = idx % d;
+    uint rem = idx / d;
+    uint t   = rem % T;
+    uint b   = rem / T;
+    res[(b * seq_len + t + 1u) * d + j] -= pred[idx];
+}

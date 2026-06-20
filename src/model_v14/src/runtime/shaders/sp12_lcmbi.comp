@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; };
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x[];     };
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  };
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint has_bilinear;
+} pc;
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (tid != 0u) return; // Only thread 0 does the sequential scan
+
+    uint half_d = pc.d_state / 2u;
+    if (dim >= half_d) return;
+
+    uint T = pc.seq_len;
+    uint batch_base = b * T * pc.d_state;
+
+    float q_prev = 0.0;
+    float p_prev = 0.0;
+
+    for (uint t = 0; t < T; t++) {
+        uint idx_q = batch_base + t * pc.d_state + dim;
+        uint idx_p = batch_base + t * pc.d_state + dim + half_d;
+
+        float beta_q = A_eff[idx_q];
+        if (pc.has_bilinear != 0u) beta_q += C_bl[dim] * x[idx_q];
+        
+        float beta = clamp(beta_q, -5.0, 5.0);
+        float cb = cosh(beta);
+        float sb = sinh(beta);
+
+        float x_q = B_eff[idx_q] * x[idx_q];
+        float x_p = B_eff[idx_p] * x[idx_p];
+
+        float q_new = q_prev * cb + p_prev * sb + x_q;
+        float p_new = q_prev * sb + p_prev * cb + x_p;
+
+        h_out[idx_q] = q_new;
+        h_out[idx_p] = p_new;
+
+        q_prev = q_new;
+        p_prev = p_new;
+    }
+}

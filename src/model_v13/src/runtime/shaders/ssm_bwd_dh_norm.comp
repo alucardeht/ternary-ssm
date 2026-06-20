@@ -1,0 +1,47 @@
+#version 450
+
+/* SSM Backward dh Norm (Q-01)
+ * Computes Et = ||\nabla_ht L||^2 and stores the normalization factor
+ * 1.0 / sqrt(Et + 1e-6) per token step.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufDH     { float dh[]; };
+layout(set = 0, binding = 1) writeonly buffer BufFactor { float factor[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+shared float s_sum_sq[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (t >= pc.seq_len) return;
+
+    uint base = (b * pc.seq_len + t) * pc.d_state;
+    float sum_sq = 0.0;
+
+    for (uint i = tid; i < pc.d_state; i += 256u) {
+        float val = dh[base + i];
+        sum_sq += val * val;
+    }
+
+    s_sum_sq[tid] = sum_sq;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        factor[b * pc.seq_len + t] = inversesqrt(s_sum_sq[0] + 1e-6);
+    }
+}

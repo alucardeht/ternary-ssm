@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer HBuf { float h[]; };
+layout(set = 0, binding = 1) buffer ActiveFlags { uint active_flags[]; };
+layout(set = 0, binding = 2) buffer LambdaBuf { float lambda[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    float threshold;
+    uint mode; // 0 = forward (measure M_t), 1 = backward (zero lambda)
+};
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= seq_len) return;
+
+    // 7. Cotangent Sheaf Triage (CST)
+    // Mechanism: Employ a lightweight, forward-owned event-time measure M_t = || \delta h_t || 
+    // that predicts dynamically dead segments, dropping caching entirely for regions with zero-gradient mass.
+    // Mathematical Object / Invariant: \lambda_t = 0 for t \notin \mathcal{T}_{active}.
+
+    if (mode == 0) {
+        float m_t = 0.0;
+        if (t > 0) {
+            for (uint c = 0; c < d_state; ++c) {
+                float delta = h[t * d_state + c] - h[(t - 1) * d_state + c];
+                m_t += delta * delta;
+            }
+            m_t = sqrt(m_t);
+        } else {
+            m_t = threshold + 1.0;
+        }
+        active_flags[t] = (m_t < threshold) ? 0 : 1;
+    } else {
+        if (active_flags[t] == 0) {
+            for (uint c = 0; c < d_state; ++c) {
+                lambda[t * d_state + c] = 0.0;
+            }
+        }
+    }
+}

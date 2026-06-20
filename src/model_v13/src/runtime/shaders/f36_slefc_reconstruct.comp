@@ -1,0 +1,26 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer SignsIn { uint signs_in[]; };
+layout(set = 0, binding = 1) buffer NormIn { float norm_in[]; };
+layout(set = 0, binding = 2) buffer HOut { float h_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.seq_len * pc.d_state;
+    if (idx >= total) return;
+
+    uint c = idx % pc.d_state;
+    float norm = norm_in[c];
+
+    uint word_idx = idx / 32;
+    uint bit_offset = idx % 32;
+    uint word = signs_in[word_idx];
+    uint sign_bit = (word >> bit_offset) & 1u;
+
+    h_out[idx] = (sign_bit == 1u) ? norm : -norm;
+}

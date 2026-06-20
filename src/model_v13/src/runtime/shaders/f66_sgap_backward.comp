@@ -1,0 +1,50 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float temperature;
+    float noise_scale;
+} pc;
+
+// Simple PRNG
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+float random_float(uint seed) {
+    return float(hash(seed)) / 4294967296.0;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Spin-Glass Annealing Protocol
+    // Add structured noise proportional to the current "temperature" of the annealing schedule.
+    // This helps escape the rough local minima typical of ternary discrete landscapes.
+    
+    float g_val = g_in[idx];
+    
+    // Generate pseudo-random noise
+    // Seed depends on index and a float bit representation to get some variance
+    float rand_val = random_float(idx ^ hash(floatBitsToUint(g_val)));
+    
+    // Noise centered at 0
+    float noise = (rand_val - 0.5) * 2.0;
+    
+    // Scale noise by temperature and explicit noise scale
+    float thermal_noise = noise * pc.temperature * pc.noise_scale;
+    
+    // Combine gradient with thermal noise
+    // The optimizer will step using this noisy gradient
+    g_out[idx] = g_val + thermal_noise;
+}

@@ -1,0 +1,68 @@
+#version 450
+
+/* R368 M1 Slice A+B — Recompute a_eff_gate on backward from sticky x_conv.
+ *
+ * Mirrors the Step 4 inner loop of elementwise_gates.comp (lines 81-88):
+ *     dot      = b_A[i] + sum_j( W_A[i*ds + j] * x_conv[t,j] )
+ *     a_gate   = sigmoid(dot)
+ *     a_eff    = A[i] * a_gate
+ *
+ * Outputs go to transient scratch buffers, NOT to the existing layer-long
+ * c->a_eff_gate / c->a_eff_buf caches (which remain alive until Slice D).
+ *
+ *   binding 4 (a_gate_scratch)  = sigmoid(dot)      — Slice A output
+ *   binding 5 (a_eff_scratch)   = A[i] * sigmoid(dot) — Slice B output
+ *
+ * GEMV inner-loop order (j ascending) and accumulation order MUST stay
+ * bit-identical to elementwise_gates.comp:83-88 so round-off matches the
+ * forward pass. The final `A[i] * a_gate` multiply is a single FMUL, same
+ * as forward line 88, so the stored a_eff_scratch values are bit-identical
+ * to fwd_a_buf / c->a_eff_buf.
+ *
+ * One workgroup per timestep t (and batch b via gl_WorkGroupID.y).
+ * 128 threads = d_state dimensions. Mirror the forward dispatch shape.
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufXcv        { float x_cv[];         };  /* [batch × seq × ds] */
+layout(set = 0, binding = 1) readonly  buffer BufWA         { float W_A[];          };  /* [ds × ds] */
+layout(set = 0, binding = 2) readonly  buffer BufbA         { float b_A[];          };  /* [ds] */
+layout(set = 0, binding = 3) readonly  buffer BufA          { float A[];            };  /* [ds] */
+layout(set = 0, binding = 4) writeonly buffer BufGateScratch{ float a_gate_scratch[]; }; /* [batch × seq × ds] */
+layout(set = 0, binding = 5) writeonly buffer BufEffScratch { float a_eff_scratch[];  }; /* [batch × seq × ds] */
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+shared float s_xconv[128];  /* shared x_conv broadcast, matching forward shader */
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint i = gl_LocalInvocationID.x;
+
+    if (t >= pc.seq_len || i >= pc.d_state) return;
+
+    uint ds      = pc.d_state;
+    uint base_ds = b * pc.seq_len * ds;
+    uint idx     = base_ds + t * ds + i;
+
+    /* Load x_conv[t, i] into shared memory for the W_A GEMV broadcast.
+     * Matches elementwise_gates.comp:73 (s_xconv[i] = xc). */
+    s_xconv[i] = x_cv[idx];
+
+    barrier();
+
+    /* --- Step 4 replay: dot = b_A[i] + sum_j(W_A[i*ds+j] * x_conv[t,j]) --- */
+    /* Inner-loop order must match elementwise_gates.comp:83-86 exactly. */
+    float dot = b_A[i];
+    for (uint j = 0; j < ds; j++) {
+        dot += W_A[i * ds + j] * s_xconv[j];
+    }
+    float a_gate = 1.0 / (1.0 + exp(-dot));  /* sigmoid */
+
+    a_gate_scratch[idx] = a_gate;
+    a_eff_scratch[idx]  = (-log(1.0 + exp(A[i])) - 0.001) * a_gate;  /* bit-identical to elementwise_gates.comp:88 */
+}

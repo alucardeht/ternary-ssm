@@ -1,0 +1,27 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufEcho { float echo_grad[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float echo_weight;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Temporal Gradient Echo (TGE)
+    // Mix a highly delayed 'echo' of past gradients to avoid short-term cycles.
+    
+    float g_val = g_in[idx];
+    float e_val = echo_grad[idx]; // Proxy: pre-calculated/stored echo gradient
+    
+    // The effective update is a combination of current gradient and the echo
+    float out_g = (1.0 - pc.echo_weight) * g_val + pc.echo_weight * e_val;
+    
+    g_out[idx] = out_g;
+}

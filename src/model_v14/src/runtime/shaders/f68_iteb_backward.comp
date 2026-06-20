@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float entropy_threshold; // Threshold for filtering based on magnitude/probability proxy
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Information-Theoretic Entropy Bottleneck
+    // We want to concentrate updates. High entropy = diffuse updates (many small values).
+    // Low entropy = concentrated updates (few large values).
+    // As a local element-wise proxy, we apply a hard or soft thresholding 
+    // that suppresses small, diffuse gradients, acting as a sparsity/entropy bottleneck.
+    
+    float g_val = g_in[idx];
+    
+    // Proxy: Soft thresholding to suppress small diffuse signals.
+    // If |g| < threshold, we strongly dampen it.
+    // This concentrates the "update entropy" into fewer, larger parameters.
+    
+    float abs_g = abs(g_val);
+    float out_g = 0.0;
+    
+    if (abs_g > pc.entropy_threshold) {
+        // Keep the signal above threshold
+        out_g = g_val - sign(g_val) * pc.entropy_threshold * 0.1; // Slight soft-thresholding shrinkage
+    } else {
+        // Strongly suppress diffuse signals below threshold
+        out_g = g_val * 0.1;
+    }
+    
+    g_out[idx] = out_g;
+}

@@ -1,0 +1,37 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufCotangentIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufMomentum { float p_momentum[]; };
+layout(set = 0, binding = 2) buffer BufCotangentOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    float dt;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+    
+    // Symplectic Hamiltonian Phase-Space Routing
+    // Instead of descent, use a symplectic integrator step (e.g. Leapfrog) on the Hamiltonian
+    // where weights are q and average gradient is p.
+    // For this shader (representing the backward flow logic over states before passing to weights),
+    // we mix the local cotangent with the Hamiltonian momentum to preserve phase-space volume.
+    
+    for (uint t = 0; t < pc.seq_len; t++) {
+        uint offset = batch_idx * pc.d_state * pc.seq_len;
+        
+        float g_val = g_in[offset + t * pc.d_state + idx];
+        float p_val = p_momentum[idx]; // Momentum accumulated
+        
+        // Leapfrog-like phase space flow approximation for the gradient signal
+        // We output a "symplectic" gradient that accounts for the momentum drift
+        float symplectic_g = g_val + pc.dt * p_val;
+        
+        g_out[offset + t * pc.d_state + idx] = symplectic_g;
+    }
+}

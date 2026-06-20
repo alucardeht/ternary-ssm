@@ -1,0 +1,151 @@
+#version 450
+
+/* SSM Backward Suffix Scan via Conjugate-Residual (CR) Adjoint Solver
+ * Solves the block adjoint equation (I - Z A.T) Lambda = G
+ * using generalized conjugate residual iteration over local sequence blocks.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufV { float v[];     }; // G
+layout(set = 0, binding = 2) buffer BufD { float dh_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint max_iters;
+    float solver_eps;
+    uint segment_length;
+} pc;
+
+shared float x_sh[64];
+shared float r_sh[64];
+shared float p_sh[8][64];
+shared float ap_sh[8][64];
+shared float dot_result[64];
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint blk = gl_WorkGroupID.y; // block index
+    uint b   = gl_WorkGroupID.z; // batch index
+    uint tid = gl_LocalInvocationID.x; // sequence within block (0 to segment_length-1)
+
+    if (dim >= pc.d_state) return;
+    
+    uint T = pc.seq_len;
+    uint seg = pc.segment_length;
+    if (tid >= seg) return;
+
+    uint t = blk * seg + tid; // global time step (forward)
+    uint batch_base = b * T * pc.d_state;
+    uint idx = batch_base + t * pc.d_state + dim;
+
+    // We are solving Lambda[t] = G[t] + A[t+1]*Lambda[t+1]
+    // In block form: X - Z A.T X = B
+    float b_val = (t < T) ? v[idx] : 0.0;
+    float a_val = (t + 1u < T) ? A_eff[batch_base + (t + 1u) * pc.d_state + dim] : 1.0;
+    a_val = clamp(a_val, 0.01, 0.817);
+    
+    // X0 = B
+    x_sh[tid] = b_val;
+    barrier();
+
+    // R0 = B - (I - Z A.T) X0
+    // (I - Z A.T) X = X[t] - a_val * X[t+1]
+    float ax = x_sh[tid];
+    if (tid + 1u < seg && t + 1u < T) {
+        ax -= a_val * x_sh[tid + 1u];
+    }
+    r_sh[tid] = b_val - ax;
+    
+    // GCR loop
+    uint iters = min(pc.max_iters, 8u);
+    for (uint i = 0u; i < iters; i++) {
+        barrier();
+        float r_val = r_sh[tid];
+        p_sh[i][tid] = r_val;
+        barrier();
+        
+        // AP = (I - Z A.T) P
+        float ap_val = p_sh[i][tid];
+        if (tid + 1u < seg && t + 1u < T) {
+            ap_val -= a_val * p_sh[i][tid + 1u];
+        }
+        
+        // Orthogonalize against previous APs
+        for (uint j = 0u; j < i; j++) {
+            float old_ap = ap_sh[j][tid];
+            dot_result[tid] = ap_val * old_ap;
+            barrier();
+            // simple block sum reduction
+            float dot_val = 0.0;
+            for (uint k = 0u; k < seg; k++) dot_val += dot_result[k];
+            barrier();
+            
+            float old_ap_norm2 = dot_result[tid] = old_ap * old_ap;
+            barrier();
+            float norm2 = 0.0;
+            for (uint k = 0u; k < seg; k++) norm2 += dot_result[k];
+            barrier();
+            
+            if (norm2 > 1e-30) {
+                float beta = dot_val / norm2;
+                ap_val -= beta * old_ap;
+                p_sh[i][tid] -= beta * p_sh[j][tid];
+            }
+            barrier();
+        }
+        ap_sh[i][tid] = ap_val;
+        barrier();
+        
+        // alpha = <R, AP> / <AP, AP>
+        dot_result[tid] = r_val * ap_val;
+        barrier();
+        float num = 0.0;
+        for (uint k = 0u; k < seg; k++) num += dot_result[k];
+        barrier();
+        
+        dot_result[tid] = ap_val * ap_val;
+        barrier();
+        float den = 0.0;
+        for (uint k = 0u; k < seg; k++) den += dot_result[k];
+        barrier();
+        
+        if (den <= 1e-30) break;
+        float alpha = num / den;
+        
+        // update X and R
+        // Finding 5: Logarithmic Quantized Adjoint Field
+        // 3-step sequence log-add-exp over 4-bit field
+        float target_update = alpha * p_sh[i][tid];
+        float q_target = target_update == 0.0 ? 0.0 : sign(target_update) * exp2(clamp(round(log2(abs(target_update))), -3.0, 4.0));
+        float q_cur = x_sh[tid] == 0.0 ? 0.0 : sign(x_sh[tid]) * exp2(clamp(round(log2(abs(x_sh[tid]))), -3.0, 4.0));
+        float sum_x = q_target + q_cur;
+        x_sh[tid] = sum_x == 0.0 ? 0.0 : sign(sum_x) * exp2(clamp(round(log2(abs(sum_x))), -3.0, 4.0));
+        r_sh[tid] -= alpha * ap_val;
+        barrier();
+        
+        // check residual
+        dot_result[tid] = r_sh[tid] * r_sh[tid];
+        barrier();
+        float r_norm2 = 0.0;
+        for (uint k = 0u; k < seg; k++) r_norm2 += dot_result[k];
+        barrier();
+        
+        // b_norm
+        dot_result[tid] = b_val * b_val;
+        barrier();
+        float b_norm2 = 0.0;
+        for (uint k = 0u; k < seg; k++) b_norm2 += dot_result[k];
+        barrier();
+        if (b_norm2 <= 0.0) b_norm2 = 1.0;
+        
+        if (sqrt(r_norm2 / b_norm2) <= pc.solver_eps) {
+            break;
+        }
+    }
+    
+    if (t < T) {
+        dh_out[idx] = x_sh[tid];
+    }
+}

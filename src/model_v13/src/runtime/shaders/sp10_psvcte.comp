@@ -1,0 +1,65 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Phase-Space Volume Contraction Trace Estimator (PSVCTE)
+// 10. Hutchinson's trace estimator on log(A). Down-project d_eff.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; };
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x[];     };
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  };
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint has_bilinear;
+} pc;
+
+void main() {
+    uint dim = gl_GlobalInvocationID.x;
+    uint b   = gl_WorkGroupID.y;
+
+    if (dim >= pc.d_state) return;
+
+    uint T = pc.seq_len;
+    uint batch_base = b * T * pc.d_state;
+
+    float h_prev = 0.0;
+
+    for (uint t = 0; t < T; t++) {
+        uint idx = batch_base + t * pc.d_state + dim;
+        
+        float a_eff_val = A_eff[idx];
+        if (pc.has_bilinear != 0u) a_eff_val += C_bl[dim] * x[idx];
+        
+        float a = clamp(a_eff_val, 0.001f, 0.999f);
+        
+        float log_a = log(a);
+        
+        // Hutchinson's Trace Estimator: Tr(log A) ~ z^T (log A) z
+        // We use a simple deterministic Rademacher distribution based on dimension index
+        float z = ((dim % 2) == 0) ? 1.0 : -1.0;
+        float hutch = z * log_a * z; // this is just log_a for diagonal A
+        
+        // Sum trace over subgroup
+        float tr_log_A = subgroupAdd(hutch);
+        
+        // d_eff \propto exp(Tr(log A))
+        // The constant 32.0 scales it so it doesn't underflow
+        float d_eff_float = float(pc.d_state) * exp(tr_log_A / 32.0);
+        uint d_eff = uint(clamp(d_eff_float, 1.0, float(pc.d_state)));
+        
+        float h_new = 0.0;
+        if (dim < d_eff) {
+            h_new = a * h_prev + B_eff[idx] * x[idx];
+        } else {
+            h_new = a * h_prev; // collapsed state
+        }
+        
+        h_out[idx] = h_new;
+        h_prev = h_new;
+    }
+}

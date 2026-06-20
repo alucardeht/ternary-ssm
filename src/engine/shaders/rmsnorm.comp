@@ -1,0 +1,59 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf {
+    uint data[];
+} weights;
+
+layout(set = 0, binding = 1) buffer ScratchBuf {
+    float data[];
+} scratch;
+
+layout(push_constant) uniform PushConstants {
+    uint y_off;
+    uint x_off;
+    uint w_off;
+    int n;
+    uint eps_bits;
+} pc;
+
+shared float partial[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    uint x_base = pc.x_off / 4;
+    uint y_base = pc.y_off / 4;
+    uint w_base = pc.w_off / 4;
+
+    float eps = uintBitsToFloat(pc.eps_bits);
+
+    float sum_sq = 0.0;
+    for (uint i = tid; i < uint(pc.n); i += 256) {
+        float x_val = scratch.data[x_base + i];
+        sum_sq += x_val * x_val;
+    }
+
+    partial[tid] = sum_sq;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+
+    float mean_sq = partial[0] / float(pc.n);
+    float rms = inversesqrt(mean_sq + eps);
+
+    barrier();
+
+    for (uint i = tid; i < uint(pc.n); i += 256) {
+        float x_val = scratch.data[x_base + i];
+        float weight = uintBitsToFloat(weights.data[w_base + i]);
+        scratch.data[y_base + i] = x_val * rms * weight;
+    }
+}

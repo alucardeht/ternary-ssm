@@ -1,0 +1,18 @@
+[meta]
+version = 1
+updated = "2026-06-07"
+purpose = "Compact numerical claims with provenance. Do not add measured numbers without RXXX source."
+
+[split]
+generated_by = "scripts/maintenance/split_hot_memory_files.py"
+generated_at = "2026-05-22T01:28:46"
+split_shard_dir = "memory/ledgers/measurement"
+cold_backup = ".work/context-heavy/docs-raw/2026-05-22-hot-memory-split/measurement-ledger.toml"
+target_shard_kb = 60
+shards = [ "memory/ledgers/measurement/measurement-001.toml", "memory/ledgers/measurement/measurement-002.toml", "memory/ledgers/measurement/measurement-003.toml", "memory/ledgers/measurement/measurement-004.toml", "memory/ledgers/measurement/measurement-005.toml", "memory/ledgers/measurement/measurement-006.toml",]
+
+[R505_GPU_FIX]
+tok_s = 20142
+vram_mb = 485
+config = "6L d1024 ds128 batch=4 seq=1024"
+notes = "Fixed CPU fallback and ef03 UAF. 100% GPU resident."

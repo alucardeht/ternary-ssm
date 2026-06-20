@@ -1,0 +1,13 @@
+*.txt
+*.bin
+*.exe
+*.o
+*.patch
+2
+create_dataset.py
+patch_train.py
+INDEX.md
+QUICK_VALIDATION.sh
+README.md
+TRAINING_RUN_R336_SUMMARY.md
+run_*.txt

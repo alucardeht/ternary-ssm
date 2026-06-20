@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufParam { float param[]; };
+layout(set = 0, binding = 1) readonly buffer BufGrad { float grad[]; };
+layout(set = 0, binding = 2) readonly buffer BufPU { float P_U[]; };
+layout(set = 0, binding = 3) readonly buffer BufPV { float P_V[]; };
+layout(set = 0, binding = 4) buffer BufSigmaM { float Sigma_M[]; };
+layout(set = 0, binding = 5) buffer BufSigmaV { float Sigma_V[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint r;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float inv_bc1;
+    float inv_bc2;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= rows * cols) return;
+
+    uint row = idx / cols;
+    uint col = idx % cols;
+    float g = grad[idx];
+
+    float m_approx = 0.0;
+    float v_approx = 0.0;
+    
+    // Reconstruct moments from the global low-rank manifold
+    for (uint k = 0; k < r; k++) {
+        float pu = P_U[row * r + k];
+        float pv = P_V[col * r + k];
+        
+        // Pseudo-local update of the Sigma components using gradient projection
+        float proj = g * pu * pv;
+        
+        if (idx == 0) {
+            Sigma_M[k] = beta1 * Sigma_M[k] + (1.0 - beta1) * proj;
+            Sigma_V[k] = beta2 * Sigma_V[k] + (1.0 - beta2) * proj * proj;
+        }
+        
+        m_approx += pu * Sigma_M[k] * pv;
+        v_approx += pu * Sigma_V[k] * pv;
+    }
+    
+    float m_hat = m_approx * inv_bc1;
+    float v_hat = abs(v_approx) * inv_bc2;
+    
+    param[idx] = param[idx] - lr * m_hat / (sqrt(v_hat) + eps);
+}

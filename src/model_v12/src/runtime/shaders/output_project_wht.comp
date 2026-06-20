@@ -1,0 +1,94 @@
+#version 450
+
+/* Fused output projection + Walsh-Hadamard Transform:
+ * 1. y[t][j] = sum_i C[j * ds + i] * h[t][i]  (GEMV per timestep)
+ * 2. WHT in-place on y[t] (butterfly, log2(ds) iterations)
+ *
+ * One workgroup per timestep, 128 threads = d_state.
+ * Dispatch: gridX = seq_len (512)
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufH    { float h_out[]; };  /* [seq × ds] */
+layout(set = 0, binding = 1) readonly  buffer BufC    { float C_mat[]; };  /* [ds × ds] */
+layout(set = 0, binding = 2) writeonly buffer BufY    { float y_ssm[]; };  /* [seq × ds] */
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+shared float s_h[128];   /* h[t] loaded for GEMV broadcast */
+shared float s_y[128];   /* y[t] for WHT in-place */
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;  /* batch index */
+    uint j = gl_LocalInvocationID.x;
+
+    if (t >= pc.seq_len || j >= pc.d_state) return;
+
+    uint ds = pc.d_state;
+    uint base = b * pc.seq_len * ds;
+
+    /* Load h[t] into shared memory for broadcast */
+    s_h[j] = h_out[base + t * ds + j];
+    barrier();
+
+    /* S-09: C-Projector Norm-Gated Short-Circuit
+     * Skips the O(D_state * D) output projection if ||h_t||_rms < epsilon
+     */
+    float sq_sum = 0.0;
+    float p4_sum = 0.0; // Q-05
+    for (uint i = 0; i < ds; i++) {
+        float h_i = s_h[i];
+        float h2 = h_i * h_i;
+        sq_sum += h2;
+        p4_sum += h2 * h2;
+    }
+    if (sqrt(sq_sum / float(ds)) < 1e-6) {
+        y_ssm[base + t * ds + j] = 0.0;
+        return;
+    }
+
+    // Q-05: Recurrent State Singular Value Soft-Bounding
+    // Scale h_t by 1 / max(1, ||h_t||_4 / tau) where tau=10.0
+    float norm_p4 = pow(p4_sum, 0.25);
+    float q05_scale = 1.0 / max(1.0, norm_p4 / 10.0);
+    s_h[j] *= q05_scale;
+    barrier();
+
+    /* --- Step 1: GEMV y[j] = C[j,:] @ h --- */
+    /* C_mat is shared across batch (no batch offset) */
+    float acc = 0.0;
+    for (uint i = 0; i < ds; i++) {
+        acc += C_mat[j * ds + i] * s_h[i];
+    }
+    s_y[j] = acc;
+
+    barrier();
+
+    /* --- Step 2: Walsh-Hadamard Transform (in-place butterfly) --- */
+    /* WHT on d_state=128 = 2^7, so 7 iterations */
+    /* Normalization: 1/sqrt(ds) applied at end */
+    for (uint wht_stride = 1u; wht_stride < ds; wht_stride *= 2u) {
+        uint idx = j;
+        uint pair = idx ^ wht_stride;  /* butterfly partner */
+
+        float a = s_y[idx];
+        float b_val = s_y[pair];
+
+        barrier();
+
+        if (idx < pair) {
+            s_y[idx] = a + b_val;
+            s_y[pair] = a - b_val;
+        }
+
+        barrier();
+    }
+
+    /* Normalize and write output */
+    float norm = 1.0 / sqrt(float(ds));  /* 1/sqrt(128) */
+    y_ssm[base + t * ds + j] = s_y[j] * norm;
+}

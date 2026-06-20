@@ -1,0 +1,35 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BufDH { float dh_in[]; };
+layout(set = 0, binding = 1) readonly buffer BufWOut { float w_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint d_model;
+    uint batch_size;
+} pc;
+
+void main() {
+    uint dim = gl_GlobalInvocationID.x;
+    if (dim >= pc.d_state) return;
+
+    bool is_null = true;
+    uint base_w = dim * pc.d_model;
+    for (uint j = 0; j < pc.d_model; j++) {
+        if (abs(w_out[base_w + j]) > 1e-5) {
+            is_null = false;
+            break;
+        }
+    }
+
+    if (is_null) {
+        for (uint b = 0; b < pc.batch_size; b++) {
+            for (uint t = 0; t < pc.seq_len; t++) {
+                uint idx = (b * pc.seq_len + t) * pc.d_state + dim;
+                dh_in[idx] = 0.0;
+            }
+        }
+    }
+}

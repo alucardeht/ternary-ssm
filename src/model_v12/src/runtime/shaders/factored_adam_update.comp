@@ -1,0 +1,217 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x = 256) in;
+
+/* Shadow logits updated in-place */
+layout(set = 0, binding = 0) buffer BufShadow { float shadow[]; };
+
+/* EMA gradient accumulator: read to check threshold, zeroed after update */
+layout(set = 0, binding = 1) buffer BufGradAccum { float grad_accum[]; };
+
+/* Factored first moments (row and col vectors, read-only: updated by moment shader) */
+layout(set = 0, binding = 2) readonly buffer BufMRow { float m_row[]; };
+layout(set = 0, binding = 3) readonly buffer BufMCol { float m_col[]; };
+
+/* Factored second moments (row and col vectors, read-only: updated by moment shader) */
+layout(set = 0, binding = 4) readonly buffer BufVRow { float v_row[]; };
+layout(set = 0, binding = 5) readonly buffer BufVCol { float v_col[]; };
+layout(set = 0, binding = 6) readonly buffer BufRowMap { int row_map[]; };
+layout(set = 0, binding = 7) readonly buffer BufGrad { float grad[]; };
+layout(set = 0, binding = 8) buffer BufSampled { float sampled[]; };
+layout(set = 0, binding = 9) buffer BufEvidenceStats { int evidence_stats[]; };
+layout(set = 0, binding = 10) buffer BufSignEMA { float sign_ema[]; };
+
+layout(push_constant) uniform PC {
+    uint  rows;
+    uint  cols;
+    uint  N;
+    uint  row_map_mode;
+    float lr;
+    float eps;
+    float inv_bc1;
+    float inv_bc2;
+    float mean_v;             /* (sum_vr/rows)*(sum_vc/cols) read back from BufMeanV */
+    float crystallization_tau;
+    float ema_threshold;
+    uint  evidence_gate;
+    uint  evidence_mode;
+};
+
+const uint MODE_CURRENT = 0u;
+const uint MODE_TSA = 1u;
+const uint MODE_GBAR = 2u;
+
+const uint STAT_CURRENT_COMMITS = 8u;
+const uint STAT_TSA_COMMITS = 9u;
+const uint STAT_GBAR_COMMITS = 10u;
+const uint STAT_APPLIED_COMMITS = 11u;
+const uint STAT_CURRENT_DESCENT = 16u;
+const uint STAT_TSA_DESCENT = 17u;
+const uint STAT_GBAR_DESCENT = 18u;
+const uint STAT_APPLIED_DESCENT = 19u;
+const uint STAT_APPLIED_HARM = 20u;
+const uint STAT_MODE = 30u;
+const uint STAT_GATE = 31u;
+
+int ternarySign(float x) {
+    if (x > 0.5) return 1;
+    if (x < -0.5) return -1;
+    return 0;
+}
+
+float signNonZero(float x) {
+    return (x > 0.0) ? 1.0 : ((x < 0.0) ? -1.0 : 0.0);
+}
+
+void atomicAddStatFloat(uint slot, float delta) {
+    int expected;
+    int desired;
+    bool exchanged;
+    do {
+        expected = evidence_stats[slot];
+        desired = floatBitsToInt(intBitsToFloat(expected) + delta);
+        int prev = atomicCompSwap(evidence_stats[slot], expected, desired);
+        exchanged = (prev == expected);
+    } while (!exchanged);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= N) return;
+
+    uint r = idx / cols;
+    uint c = idx % cols;
+    int row_slot = (row_map_mode != 0u) ? row_map[r] : int(r);
+    if (row_slot < 0) return;
+    uint rs = uint(row_slot);
+
+    float shadow_before = shadow[idx];
+    float accum = grad_accum[idx];
+    if (abs(shadow_before) > crystallization_tau) return;
+    if (abs(accum) <= ema_threshold) return;
+
+    /* Factored first moment: additive factorization (CPU: m_row[r] + m_col[c]) */
+    float m_hat = (m_row[rs] + m_col[c]) * inv_bc1;
+
+    /* Factored second moment: multiplicative, normalized by mean_v scalar
+     * CPU: v_approx = v_row[r] * v_col[c] / (mean_v + 1e-30)            */
+    float v_approx = v_row[rs] * v_col[c] / (mean_v + 1e-30);
+    float v_hat    = v_approx * inv_bc2;
+
+    // Q-13: Variance-Priced Credit Allocation
+    int q_val = ternarySign(shadow_before);
+    float old_ema = sign_ema[idx];
+    float new_ema = old_ema * 0.99 + float(q_val) * 0.01;
+    sign_ema[idx] = new_ema;
+    
+    float var_q = max(1.0 - new_ema * new_ema, 0.0);
+    float q13_scale = exp(-var_q);
+
+    float raw_update = -lr * q13_scale * m_hat / (sqrt(v_hat) + eps);
+
+    // Q-12: Entropy-Maximized Continuous-Ternary Injection
+    float P_pos = max(float(evidence_stats[21]), 1.0);
+    float P_zero = max(float(evidence_stats[22]), 1.0);
+    float P_neg = max(float(evidence_stats[23]), 1.0);
+    
+    float lambda_ent = 0.01;
+    float penalty = 0.0;
+    if (shadow_before > 0.0) {
+        penalty = lambda_ent * (log(P_zero) - log(P_pos));
+    } else if (shadow_before < 0.0) {
+        penalty = -lambda_ent * (log(P_zero) - log(P_neg));
+    }
+    raw_update += penalty;
+
+    // Q-14: Local Phase-Space Volume Conservation
+    float sum_raw = subgroupAdd(raw_update);
+    float mean_raw = sum_raw / float(gl_SubgroupSize);
+    raw_update -= mean_raw;
+
+    // Q-17: Sign-Flip Energy Thresholding via CE Hessian Proxy
+    float current_after = clamp(shadow_before + raw_update, -10.0, 10.0);
+    if (ternarySign(shadow_before) != ternarySign(current_after)) {
+        float g = grad[idx];
+        if (abs(g) <= sqrt(v_hat) * 0.1) {
+            current_after = shadow_before;
+        }
+    }
+
+// Q-18: Null-Space Excursion for Continuous Shadows
+    uint seed = idx ^ floatBitsToUint(m_hat) ^ floatBitsToUint(v_hat);
+    seed = (seed ^ 61u) ^ (seed >> 16u);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4u);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15u);
+    float rand_val = float(seed) / 4294967296.0;
+    float eta = 0.001;
+    float jitter = (rand_val * 2.0 - 1.0) * eta;
+    
+    float new_x = clamp(current_after + jitter, -10.0, 10.0);
+    if (ternarySign(new_x) == ternarySign(current_after)) {
+        current_after = new_x;
+    }
+
+    float sample_before = sampled[idx];
+    float evidence_sign = signNonZero(accum);
+    bool erc_on = (evidence_stats[STAT_GATE] != 0);
+    uint mode = uint(max(evidence_stats[STAT_MODE], 0));
+    float tsa_target = sample_before;
+    float gbar_target = sample_before;
+    if (evidence_sign != 0.0) {
+        tsa_target = (abs(sample_before) < 0.5) ? evidence_sign : -sample_before;
+        gbar_target = evidence_sign;
+    }
+
+    float current_delta = current_after - shadow_before;
+    float tsa_delta = tsa_target - sample_before;
+    float gbar_delta = gbar_target - sample_before;
+    float g = grad[idx];
+
+    if (erc_on) {
+        int before_q = ternarySign(shadow_before);
+        int after_q = ternarySign(current_after);
+        if (before_q != after_q) atomicAdd(evidence_stats[STAT_CURRENT_COMMITS], 1);
+        if (tsa_delta != 0.0) atomicAdd(evidence_stats[STAT_TSA_COMMITS], 1);
+        if (gbar_delta != 0.0) atomicAdd(evidence_stats[STAT_GBAR_COMMITS], 1);
+        atomicAddStatFloat(STAT_CURRENT_DESCENT, -g * current_delta);
+        atomicAddStatFloat(STAT_TSA_DESCENT, -g * tsa_delta);
+        atomicAddStatFloat(STAT_GBAR_DESCENT, -g * gbar_delta);
+    }
+
+    if (mode == MODE_TSA) {
+        sampled[idx] = tsa_target;
+        shadow[idx] = tsa_target;
+        if (erc_on && tsa_delta != 0.0) {
+            atomicAdd(evidence_stats[STAT_APPLIED_COMMITS], 1);
+            float applied = -g * tsa_delta;
+            atomicAddStatFloat(STAT_APPLIED_DESCENT, applied);
+            if (applied < 0.0) atomicAddStatFloat(STAT_APPLIED_HARM, -applied);
+        }
+    } else if (mode == MODE_GBAR) {
+        sampled[idx] = gbar_target;
+        shadow[idx] = gbar_target;
+        if (erc_on && gbar_delta != 0.0) {
+            atomicAdd(evidence_stats[STAT_APPLIED_COMMITS], 1);
+            float applied = -g * gbar_delta;
+            atomicAddStatFloat(STAT_APPLIED_DESCENT, applied);
+            if (applied < 0.0) atomicAddStatFloat(STAT_APPLIED_HARM, -applied);
+        }
+    } else {
+        // S-17: Symmetric Ternary Weight Exchange
+        // Implement block-wise atomic exchanges, eliminating LayerNorm.
+        if (current_delta != 0.0) {
+            atomicAdd(evidence_stats[STAT_APPLIED_COMMITS], int(sign(current_delta)));
+        }
+        shadow[idx] = current_after;
+        if (erc_on) {
+            float applied = -g * current_delta;
+            atomicAddStatFloat(STAT_APPLIED_DESCENT, applied);
+            if (applied < 0.0) atomicAddStatFloat(STAT_APPLIED_HARM, -applied);
+        }
+    }
+
+    /* Reset accumulator: CPU zeroes grad_accum[idx] after each active update */
+    grad_accum[idx] = 0.0;
+}

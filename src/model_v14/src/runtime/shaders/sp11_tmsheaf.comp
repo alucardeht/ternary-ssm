@@ -1,0 +1,54 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer InA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer InB { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer OutSim { float Sim[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint num_tokens;
+    uint ds;
+} pc;
+
+shared float s_dot[128];
+shared float s_normA[128];
+shared float s_normB[128];
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    if (token_idx >= pc.num_tokens) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint offset = token_idx * pc.ds;
+    
+    float a = A[offset + tid];
+    float b = B[offset + tid];
+    
+    s_dot[tid] = a * b;
+    s_normA[tid] = a * a;
+    s_normB[tid] = b * b;
+    
+    barrier();
+    
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_dot[tid] += s_dot[tid + s];
+            s_normA[tid] += s_normA[tid + s];
+            s_normB[tid] += s_normB[tid + s];
+        }
+        barrier();
+    }
+    
+    if (tid == 0) {
+        float dot_prod = s_dot[0];
+        float normA_val = sqrt(s_normA[0]);
+        float normB_val = sqrt(s_normB[0]);
+        
+        float cos_sim = 0.0;
+        if (normA_val > 1e-6 && normB_val > 1e-6) {
+            cos_sim = dot_prod / (normA_val * normB_val);
+        }
+        
+        Sim[token_idx] = cos_sim;
+    }
+}

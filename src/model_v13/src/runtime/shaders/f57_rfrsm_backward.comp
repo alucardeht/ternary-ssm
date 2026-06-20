@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufCotangentIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufState { float h_state[]; };
+layout(set = 0, binding = 2) buffer BufCotangentOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    float flow_rate;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+    
+    // Ricci Flow Regularization on State Metric
+    // Approximating the metric curvature via the 2nd derivative (Laplacian)
+    // of the state along the sequence, and adjusting the gradient flow to 
+    // "flatten" sharp curvature pinches.
+    
+    for (uint t = 0; t < pc.seq_len; t++) {
+        uint offset = batch_idx * pc.d_state * pc.seq_len;
+        uint t_idx = offset + t * pc.d_state + idx;
+        
+        float g_val = g_in[t_idx];
+        
+        // Compute discrete Laplacian of the state as a proxy for curvature
+        float h_t = h_state[t_idx];
+        float h_tm1 = (t > 0) ? h_state[offset + (t - 1) * pc.d_state + idx] : h_t;
+        float h_tp1 = (t < pc.seq_len - 1) ? h_state[offset + (t + 1) * pc.d_state + idx] : h_t;
+        
+        float curvature_proxy = h_tp1 - 2.0 * h_t + h_tm1;
+        
+        // Ricci flow adjusts the metric (and thus the gradient) proportional to curvature
+        // We inject this as a regularizing force on the gradient.
+        float ricci_adj = -pc.flow_rate * curvature_proxy;
+        
+        g_out[t_idx] = g_val + ricci_adj;
+    }
+}

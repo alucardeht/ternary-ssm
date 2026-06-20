@@ -1,0 +1,105 @@
+#version 450
+
+/* Sampled CE — Scatter d_logits through CSR rows into d_h
+ *
+ * One workgroup per valid position (b, t) where t in [0, T-1).
+ * Total dispatch: B * (T-1) workgroups.
+ *
+ * Each workgroup owns a unique d_h[b, t, :] slice, so no atomics are
+ * needed: writes within a workgroup are race-free by construction.
+ *
+ * For each candidate sample s at this position:
+ *   1. Read d_logit scalar from DLogits[pos * n_samples + s].
+ *   2. Look up the vocab row index from SampleIDs[pos * n_samples + s].
+ *   3. Scatter +dg through RowPtrPos / PosIndices (positive ternary weights).
+ *   4. Scatter -dg through RowPtrNeg / NegIndices (negative ternary weights).
+ *   256 threads stride across each CSR row in parallel; a barrier ensures
+ *   all threads complete one sample before advancing to the next.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if TOLR_ENABLED
+layout(set = 0, binding = 0) readonly  buffer BufEmbedE     { float embed_E[];    };
+layout(set = 0, binding = 1) readonly  buffer BufEmbedP     { float embed_P[];    };
+layout(set = 0, binding = 2) readonly  buffer BufDummy1     { int   dummy1[];     };
+layout(set = 0, binding = 3) readonly  buffer BufDummy2     { int   dummy2[];     };
+#else
+layout(set = 0, binding = 0) readonly  buffer BufRowPtrPos  { int   rpp[];        };
+layout(set = 0, binding = 1) readonly  buffer BufPosIndices { int   pi[];         };
+layout(set = 0, binding = 2) readonly  buffer BufRowPtrNeg  { int   rpn[];        };
+layout(set = 0, binding = 3) readonly  buffer BufNegIndices { int   ni[];         };
+#endif
+layout(set = 0, binding = 4) readonly  buffer BufSampleIDs  { uint  sample_ids[]; };
+layout(set = 0, binding = 5) readonly  buffer BufDLogits    { float d_logits[];   };
+layout(set = 0, binding = 6)           buffer BufDH         { float dh[];         };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_model;
+    uint n_samples;
+    uint batch_size;
+} pc;
+
+#if TOLR_ENABLED
+shared float s_e_grad[128];
+#endif
+
+void main() {
+    uint pos = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint total_positions = pc.batch_size * (pc.seq_len - 1u);
+    if (pos >= total_positions) return;
+
+    uint b       = pos / (pc.seq_len - 1u);
+    uint t       = pos % (pc.seq_len - 1u);
+    uint dh_base = (b * pc.seq_len + t) * pc.d_model;
+
+#if TOLR_ENABLED
+    if (tid < 128u) {
+        float sum = 0.0;
+        uint e = tid;
+        for (uint s = 0u; s < pc.n_samples; s++) {
+            float dg = d_logits[pos * pc.n_samples + s];
+            if (abs(dg) < 1e-12) continue;
+            uint v = sample_ids[pos * pc.n_samples + s];
+            sum += dg * embed_E[v * 128u + e];
+        }
+        s_e_grad[e] = sum;
+    }
+    barrier();
+
+    for (uint j = tid; j < pc.d_model; j += 256u) {
+        float sum = 0.0;
+        for (uint e = 0u; e < 128u; e++) {
+            sum += s_e_grad[e] * embed_P[e * pc.d_model + j];
+        }
+        dh[dh_base + j] += sum;
+    }
+#else
+    for (uint s = 0u; s < pc.n_samples; s++) {
+        float dg = d_logits[pos * pc.n_samples + s];
+
+        if (abs(dg) < 1e-12) {
+            barrier();
+            continue;
+        }
+
+        uint row = sample_ids[pos * pc.n_samples + s];
+
+        int p_start = rpp[row];
+        int p_end   = rpp[row + 1u];
+        for (int k = p_start + int(tid); k < p_end; k += 256) {
+            dh[dh_base + uint(pi[k])] += dg;
+        }
+
+        int n_start = rpn[row];
+        int n_end   = rpn[row + 1u];
+        for (int k = n_start + int(tid); k < n_end; k += 256) {
+            dh[dh_base + uint(ni[k])] -= dg;
+        }
+
+        barrier();
+    }
+#endif
+}

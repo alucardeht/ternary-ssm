@@ -1,0 +1,82 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; }; // (b, d, t)
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; }; // (b, d, t)
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x[];     }; // (b, d, t)
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  }; // (d)
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; }; // (b, d, t)
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint has_bilinear;
+} pc;
+
+shared float sh_A[32];
+shared float sh_B[32];
+shared float sh_X[32];
+shared float sh_X_p[32];
+shared float sh_B_p[32];
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint half_d = pc.d_state / 2u;
+    if (dim >= half_d) return;
+
+    uint T = pc.seq_len;
+    uint batch_base = b * pc.d_state * T;
+    
+    uint base_q = batch_base + dim * T;
+    uint base_p = batch_base + (dim + half_d) * T;
+
+    float q_prev = 0.0;
+    float p_prev = 0.0;
+
+    for (uint t_base = 0; t_base < T; t_base += 32u) {
+        uint t = t_base + tid;
+        
+        if (t < T) {
+            sh_A[tid] = A_eff[base_q + t];
+            sh_B[tid] = B_eff[base_q + t];
+            sh_X[tid] = x[base_q + t];
+            sh_B_p[tid] = B_eff[base_p + t];
+            sh_X_p[tid] = x[base_p + t];
+        }
+        barrier();
+
+        if (tid == 0u) {
+            uint limit = min(32u, T - t_base);
+            for (uint i = 0; i < limit; i++) {
+                float beta_q = sh_A[i];
+                if (pc.has_bilinear != 0u) beta_q += C_bl[dim] * sh_X[i];
+                
+                float beta = clamp(beta_q, -5.0, 5.0);
+                float cb = cosh(beta);
+                float sb = sinh(beta);
+
+                float x_q = sh_B[i] * sh_X[i];
+                float x_p = sh_B_p[i] * sh_X_p[i];
+
+                float q_new = q_prev * cb + p_prev * sb + x_q;
+                float p_new = q_prev * sb + p_prev * cb + x_p;
+
+                sh_A[i] = q_new;
+                sh_B[i] = p_new;
+
+                q_prev = q_new;
+                p_prev = p_new;
+            }
+        }
+        barrier();
+
+        if (t < T) {
+            h_out[base_q + t] = sh_A[tid];
+            h_out[base_p + t] = sh_B[tid];
+        }
+        barrier();
+    }
+}

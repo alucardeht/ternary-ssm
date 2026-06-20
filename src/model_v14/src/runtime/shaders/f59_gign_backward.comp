@@ -1,0 +1,37 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufParam { float param[]; };
+layout(set = 0, binding = 2) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float gauge_scale;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Gauge-Invariant Gradient Normalization
+    // Normalize gradients by projecting them onto the tangent space of the gauge orbit.
+    // For a simple scale gauge, this means removing the component of the gradient that
+    // simply scales the parameters.
+    
+    float g_val = g_in[idx];
+    float p_val = param[idx];
+    
+    // Approximate gauge component: (g dot p) / (p dot p) * p
+    // In a massively parallel context without a full reduction, we do a localized
+    // block-wise or element-wise proxy for the gauge transformation.
+    // Here we use an element-wise radial projection:
+    
+    float p_norm_sq = p_val * p_val + 1e-8;
+    float radial_component = (g_val * p_val) / p_norm_sq * p_val;
+    
+    // Remove the radial (gauge) component to ensure the gradient only acts on the angular (invariant) part
+    float gauge_inv_g = g_val - pc.gauge_scale * radial_component;
+    
+    g_out[idx] = gauge_inv_g;
+}

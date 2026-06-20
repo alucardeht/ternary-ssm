@@ -1,0 +1,59 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0) readonly  buffer BufShadow  { float shadow[];  };
+layout(set=0, binding=1) buffer BufSampled { float sampled[]; };
+layout(set=0, binding=2) buffer BufFlipCounts { uint flip_counts[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint rng_seed;
+    uint flip_index;
+};
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x45d9f3bu;
+    x ^= x >> 16;
+    x *= 0x45d9f3bu;
+    x ^= x >> 16;
+    return x;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= N) return;
+
+    float prev  = sampled[i];
+    float s     = shadow[i];
+    float abs_s = abs(s);
+    float nextv = 0.0;
+
+    if (abs_s >= 1.0) {
+        nextv = (s > 0.0) ? 1.0 : -1.0;
+        if (prev != nextv) {
+            atomicAdd(flip_counts[flip_index], 1u);
+        }
+        sampled[i] = nextv;
+        return;
+    }
+
+    uint  rng   = hash(rng_seed ^ i);
+    float u     = float(rng) / 4294967296.0;
+
+    float p_pos = max( s, 0.0);
+    float p_neg = max(-s, 0.0);
+
+    if (u < p_pos) {
+        nextv = 1.0;
+    } else if (u < p_pos + p_neg) {
+        nextv = -1.0;
+    } else {
+        nextv = 0.0;
+    }
+
+    if (prev != nextv) {
+        atomicAdd(flip_counts[flip_index], 1u);
+    }
+    sampled[i] = nextv;
+}

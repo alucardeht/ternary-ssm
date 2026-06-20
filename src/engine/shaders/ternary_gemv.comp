@@ -1,0 +1,82 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf {
+    uint data[];
+} weights;
+
+layout(set = 0, binding = 1) buffer ScratchBuf {
+    float data[];
+} scratch;
+
+layout(push_constant) uniform PushConstants {
+    uint y_off;
+    uint W_off;
+    uint scale_off;
+    uint x_off;
+    uint bias_off;
+    int rows;
+    int cols;
+} pc;
+
+shared float partial[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= uint(pc.rows)) {
+        return;
+    }
+
+    uint x_base = pc.x_off / 4;
+    uint y_base = pc.y_off / 4;
+    uint W_base = pc.W_off / 4;
+    uint scale_base = pc.scale_off / 4;
+    uint bias_base = (pc.bias_off != 0) ? (pc.bias_off / 4) : 0;
+
+    uint bytes_per_row = (uint(pc.cols) + 3) / 4;
+    uint row_start = W_base + row * bytes_per_row;
+
+    float acc = 0.0;
+
+    for (uint c = tid; c < uint(pc.cols); c += 256) {
+        uint byte_idx = row_start + (c / 4);
+        uint word_idx = byte_idx / 4;
+        uint word = weights.data[word_idx];
+        uint byte_val = (word >> ((byte_idx % 4) * 8)) & 0xFF;
+
+        uint bits = (byte_val >> ((c % 4) * 2)) & 0x3;
+
+        float x_val = scratch.data[x_base + c];
+
+        if (bits == 1u) {
+            acc += x_val;
+        } else if (bits == 2u) {
+            acc -= x_val;
+        }
+    }
+
+    partial[tid] = acc;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        float scale = uintBitsToFloat(weights.data[scale_base + row]);
+        float result = partial[0] * scale;
+
+        if (pc.bias_off != 0) {
+            result += uintBitsToFloat(weights.data[bias_base + row]);
+        }
+
+        scratch.data[y_base + row] = result;
+    }
+}

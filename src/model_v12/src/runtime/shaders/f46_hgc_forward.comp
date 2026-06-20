@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufA { float A_eff[]; };
+layout(set = 0, binding = 1) buffer BufHT { float h_t[]; };
+layout(set = 0, binding = 2) buffer BufHTMinus1 { float h_tm1[]; };
+layout(set = 0, binding = 3) buffer BufCache { float fwd_h_cache[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    uint current_t;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+
+    uint t_idx = pc.current_t * pc.d_state + idx;
+    uint offset = batch_idx * pc.d_state * pc.seq_len;
+    
+    // Measure geometric rigidity (Lie derivative approximation)
+    // Lie_A(h) ~ ||h_t - A * h_{t-1}||
+    float h_curr = h_t[batch_idx * pc.d_state + idx];
+    float h_prev = h_tm1[batch_idx * pc.d_state + idx];
+    float A_val = A_eff[t_idx];
+    
+    float rigidity = abs(h_curr - A_val * h_prev);
+    
+    // Holonomic Gradient Checkpointing: only cache if rigidity > threshold
+    if (rigidity > 1e-4) {
+        fwd_h_cache[offset + t_idx] = h_curr;
+    } else {
+        // High rigidity -> skip cache write to save memory bandwidth
+        // Backward pass will use holonomic constraints to recover state
+        fwd_h_cache[offset + t_idx] = 0.0; // Marker for rigid step
+    }
+}

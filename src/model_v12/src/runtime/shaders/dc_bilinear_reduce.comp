@@ -1,0 +1,44 @@
+#version 450
+
+/* dC_bilinear gradient reduction
+ *
+ * One workgroup of 128 threads, one thread per state dimension i.
+ * Dispatch: (1, 1, 1) — single workgroup, d_state <= 128.
+ *
+ * Computes:
+ *   dc_bl[i] += sum_{b=0}^{B-1} sum_{t=1}^{T-1} dh[b*T*ds + t*ds + i]
+ *                                                * h_cache[b*T*ds + (t-1)*ds + i]
+ *                                                * x_cv[b*T*ds + t*ds + i]
+ *
+ * The buffer dc_bl is read-modify-written (non-writeonly) so existing
+ * accumulated values from prior backward passes are preserved.
+ * No atomics needed: single workgroup, one thread per i, no aliasing.
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufDH     { float dh[];      };
+layout(set = 0, binding = 1) readonly buffer BufHcache { float h_cache[]; };
+layout(set = 0, binding = 2) readonly buffer BufXcv    { float x_cv[];    };
+layout(set = 0, binding = 3)          buffer BufDCbl   { float dc_bl[];   };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint batch_size;
+};
+
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    if (i >= d_state) return;
+
+    float acc = 0.0;
+    for (uint b = 0u; b < batch_size; b++) {
+        uint base = b * seq_len * d_state;
+        for (uint t = 1u; t < seq_len; t++) {
+            uint idx  = base + t * d_state + i;
+            uint prev = base + (t - 1u) * d_state + i;
+            acc += dh[idx] * h_cache[prev] * x_cv[idx];
+        }
+    }
+    dc_bl[i] += acc;
+}

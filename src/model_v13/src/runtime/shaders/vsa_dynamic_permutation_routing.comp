@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InData {
+    float in_data[];
+};
+
+layout(set = 0, binding = 1) readonly buffer ShiftData {
+    float shift_data[];
+};
+
+layout(set = 0, binding = 2) buffer OutData {
+    float out_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_tokens;
+    uint ds; // Dimension of state
+} p;
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    if (token_idx >= p.num_tokens) return;
+    
+    uint local_idx = gl_LocalInvocationID.x;
+    uint base_idx = token_idx * p.ds;
+    
+    // The shift is determined by the first element of the shift_data for this token,
+    // converted to an integer shift.
+    // (In a real scenario, this would be computed from the context).
+    float raw_shift = shift_data[token_idx * p.ds];
+    uint shift = uint(abs(raw_shift * 1000.0)) % p.ds;
+    
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        // Coordinate binding via cyclic shifts (Dynamic Permutation Routing)
+        uint permuted_idx = (i + shift) % p.ds;
+        out_data[base_idx + i] = in_data[base_idx + permuted_idx];
+    }
+}

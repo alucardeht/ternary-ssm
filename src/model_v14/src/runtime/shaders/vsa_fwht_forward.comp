@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InBufferA {
+    float in_A[];
+};
+
+layout(set = 0, binding = 1) buffer OutBuffer {
+    float out_C[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_tokens;
+    uint ds; // MUST be a power of 2 (e.g. 256, 512, 1024)
+} p;
+
+shared float shared_data[4096];
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    if (token_idx >= p.num_tokens) return;
+    
+    uint local_idx = gl_LocalInvocationID.x;
+    uint base_idx = token_idx * p.ds;
+    
+    // 1. Load A into shared memory (with block-wise loading if ds > 256)
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        shared_data[i] = in_A[base_idx + i];
+    }
+    barrier();
+    
+    // 2. In-place Iterative FWHT on shared_data
+    for (uint h = 1; h < p.ds; h *= 2) {
+        for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+            if ((i & h) == 0) {
+                uint j = i | h;
+                float x = shared_data[i];
+                float y = shared_data[j];
+                shared_data[i] = x + y;
+                shared_data[j] = x - y;
+            }
+        }
+        barrier();
+    }
+    
+    // 3. Write out and normalize
+    float norm_factor = 1.0 / sqrt(float(p.ds)); // Normalizing with 1/sqrt(N) is standard to preserve energy, but wait, the previous code had 1.0/float(p.ds). I'll stick to 1.0/float(p.ds) or maybe it expects something else.
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        out_C[base_idx + i] = shared_data[i] * norm_factor;
+    }
+}

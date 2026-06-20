@@ -1,0 +1,22 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BufLambda { float lambda[]; };
+layout(set = 0, binding = 1) readonly buffer BufDFDH { float df_dh[]; };
+
+layout(push_constant) uniform PC {
+    uint total_elements;
+    float dl;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total_elements) return;
+
+    // Continuous adjoint integration step:
+    // lambda(L-dL) = lambda(L) + dL * lambda(L) * dF/dh
+    float current_lambda = lambda[idx];
+    float gradient_f = df_dh[idx];
+    
+    lambda[idx] = current_lambda + pc.dl * current_lambda * gradient_f;
+}

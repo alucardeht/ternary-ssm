@@ -1,0 +1,39 @@
+#version 450
+
+/* Backward for output_project_wht after the WHT inverse has already been
+ * applied in-place to d_y_ssm.
+ *
+ * Forward pre-WHT:
+ *   y[j] = sum_i C[j,i] * h[i]
+ *
+ * Backward:
+ *   d_h[i] = sum_j C[j,i] * d_y[j]
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufDY { float d_y[];  };
+layout(set = 0, binding = 1) readonly  buffer BufC  { float C_mat[]; };
+layout(set = 0, binding = 2) writeonly buffer BufDH { float d_h[];  };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint i = gl_LocalInvocationID.x;
+
+    if (t >= pc.seq_len || i >= pc.d_state) return;
+
+    uint ds = pc.d_state;
+    uint base = b * pc.seq_len * ds;
+    uint row = base + t * ds;
+
+    float acc = 0.0;
+    for (uint j = 0u; j < ds; j++) {
+        acc += C_mat[j * ds + i] * d_y[row + j];
+    }
+    d_h[row + i] = acc;
+}

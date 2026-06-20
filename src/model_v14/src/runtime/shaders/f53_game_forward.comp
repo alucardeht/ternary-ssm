@@ -1,0 +1,36 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufTokens { uint tokens[]; };
+layout(set = 0, binding = 1) buffer BufEmbeddings { float embeddings[]; }; // (vocab, d_model * 4) since we store scalar, vector(2), bivector(1) per component
+layout(set = 0, binding = 2) buffer BufMultivectorOut { float mv_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_model; // We treat d_model as the number of multivector components
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x; // up to d_model
+    uint t = gl_GlobalInvocationID.y; // up to seq_len
+    if (idx >= pc.d_model || t >= pc.seq_len) return;
+    
+    // Geometric Algebra Multivector Embedding
+    // Each token embedding is lifted into a 2D Clifford algebra Cl_{2,0}
+    // Component basis: 1, e1, e2, e12 (4 floats per d_model unit)
+    
+    uint token = tokens[t];
+    uint emb_offset = token * pc.d_model * 4 + idx * 4;
+    
+    float scalar = embeddings[emb_offset + 0];
+    float e1     = embeddings[emb_offset + 1];
+    float e2     = embeddings[emb_offset + 2];
+    float e12    = embeddings[emb_offset + 3];
+    
+    // Pass them raw or apply some initial rotor? We just pass the multivector to the state.
+    uint out_offset = t * pc.d_model * 4 + idx * 4;
+    mv_out[out_offset + 0] = scalar;
+    mv_out[out_offset + 1] = e1;
+    mv_out[out_offset + 2] = e2;
+    mv_out[out_offset + 3] = e12;
+}

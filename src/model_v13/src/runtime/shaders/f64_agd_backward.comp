@@ -1,0 +1,45 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufHessianDiag { float h_diag[]; };
+layout(set = 0, binding = 2) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float diffusion_rate;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Anisotropic Gradient Diffusion
+    // Diffuse gradients along flat directions (small Hessian diagonal) to pool signal,
+    // but preserve gradients along sharp directions (large Hessian diagonal).
+    // In a 1D/element-wise proxy, we mix the gradient with its neighbors,
+    // weighted inversely by the Hessian diagonal.
+    
+    float g_val = g_in[idx];
+    float h_val = abs(h_diag[idx]) + 1e-8; // Prevent division by zero
+    
+    float diffused_g = g_val;
+    
+    // Simple 1D proxy for diffusion
+    if (idx > 0 && idx < pc.param_size - 1) {
+        float h_left = abs(h_diag[idx - 1]) + 1e-8;
+        float h_right = abs(h_diag[idx + 1]) + 1e-8;
+        
+        float g_left = g_in[idx - 1];
+        float g_right = g_in[idx + 1];
+        
+        // Diffusion coefficient inversely proportional to sharpness
+        // Flatter = more diffusion
+        float d_left = pc.diffusion_rate / (h_val + h_left);
+        float d_right = pc.diffusion_rate / (h_val + h_right);
+        
+        diffused_g += d_left * (g_left - g_val) + d_right * (g_right - g_val);
+    }
+    
+    g_out[idx] = diffused_g;
+}

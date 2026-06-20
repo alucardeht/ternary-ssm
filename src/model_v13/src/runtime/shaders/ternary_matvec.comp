@@ -1,0 +1,188 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+/* One workgroup per output row.
+ * 256 threads collaborate to reduce all nonzeros in that row.
+ * y[row] = sum(x[pos_indices]) - sum(x[neg_indices])
+ * NO multiplication — purely gather-and-add/subtract.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef S01_PACKED
+/* S-01 Subgroup-Packed Ternary Dot Product Integrator */
+layout(set = 0, binding = 0) readonly buffer Dummy1 { int dummy1[]; };
+layout(set = 0, binding = 1) readonly buffer Packed { uint w_packed[]; };
+layout(set = 0, binding = 2) readonly buffer Dummy2 { int dummy2[]; };
+layout(set = 0, binding = 3) readonly buffer SignUnused { uint dummy3[]; };
+layout(set = 0, binding = 4) readonly buffer InputX     { float x[]; };
+layout(set = 0, binding = 5) writeonly buffer OutputY   { float y[]; };
+#else
+/* 6 SSBOs: 4 CSR arrays + input + output */
+layout(set = 0, binding = 0) readonly buffer RowPtrPos { int rpp[]; };
+layout(set = 0, binding = 1) readonly buffer PosIndices { int pi[]; };
+layout(set = 0, binding = 2) readonly buffer RowPtrNeg { int rpn[]; };
+layout(set = 0, binding = 3) readonly buffer NegIndices { int ni[]; };
+layout(set = 0, binding = 4) readonly buffer InputX     { float x[]; };
+layout(set = 0, binding = 5) writeonly buffer OutputY   { float y[]; };
+#endif
+
+/* Push constants: matrix dims and batch info */
+layout(push_constant) uniform PC {
+    uint rows;         /* number of output rows */
+    uint cols;         /* number of input columns */
+    uint batch_size;   /* number of vectors in this dispatch */
+    uint x_stride;     /* stride between consecutive input vectors (floats) */
+    uint y_stride;     /* stride between consecutive output vectors (floats) */
+    uint batch_offset; /* offset for split dispatches (WDDM stall prevention) */
+} pc;
+
+/* Shared memory for parallel reduction */
+
+void csa_add(inout uint sum, inout uint carry, uint val) {
+    uint a = sum;
+    uint b = carry;
+    uint c = val;
+    sum = a ^ b ^ c;
+    carry = ((a & b) | (b & c) | (a & c)) << 1;
+}
+
+uint resolve_csa(uint sum, uint carry) {
+    while (carry != 0u) {
+        uint next_carry = (sum & carry) << 1;
+        sum = sum ^ carry;
+        carry = next_carry;
+    }
+    return sum;
+}
+
+shared float s_pos[256];
+shared float s_neg[256];
+
+void main() {
+    uint row       = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y + pc.batch_offset;
+    uint tid       = gl_LocalInvocationID.x;
+
+    if (row >= pc.rows || batch_idx >= pc.batch_size) return;
+
+    uint x_base = batch_idx * pc.x_stride;
+    uint y_base = batch_idx * pc.y_stride;
+
+    // S-14: Matrix-Vector Pre-Broadcast Gating
+    // Fast proxy L1 check: if the first few elements sum to ~0, the whole vector is gated out.
+    float x_l1 = 0.0;
+    for (uint i = 0; i < min(pc.cols, 32u); i++) {
+        x_l1 += abs(x[x_base + i]);
+    }
+    if (x_l1 < 1e-6) {
+        if (tid == 0u) y[y_base + row] = 0.0;
+        return;
+    }
+
+#ifdef S01_PACKED
+    uint acc_pos_sum = 0u; uint acc_pos_carry = 0u;
+    uint acc_neg_sum = 0u; uint acc_neg_carry = 0u;
+    
+    /* 32 weights per uint32 pair (mag, sign) */
+    // S-21: Ternary Weight Bit-Interleaving Dispatch
+    // Weights are interleaved in w_packed. Each weight is 2 bits.
+    // 16 weights per uint32.
+    uint words_per_row = (pc.cols + 15u) / 16u;
+    uint row_offset = row * words_per_row;
+    
+    for (uint k = tid; k < words_per_row; k += 256u) {
+        uint packed = w_packed[row_offset + k];
+        uint mag = packed & 0x55555555u;
+        uint sign = (packed >> 1) & 0x55555555u;
+        uint pos = mag & ~sign;
+        uint neg = mag & sign;
+        uint col_base = k * 16u;
+        
+        while (pos != 0u) {
+            int j = findLSB(pos);
+            if (col_base + uint(j)/2u < pc.cols) {
+                csa_add(acc_pos_sum, acc_pos_carry, uint(int(x[x_base + col_base + uint(j)/2u] * 65536.0)));
+            }
+            pos &= ~(1u << uint(j));
+        }
+        while (neg != 0u) {
+            int j = findLSB(neg);
+            if (col_base + uint(j)/2u < pc.cols) {
+                csa_add(acc_neg_sum, acc_neg_carry, uint(int(x[x_base + col_base + uint(j)/2u] * 65536.0)));
+            }
+            neg &= ~(1u << uint(j));
+        }
+    }
+    
+    float acc_pos = float(int(resolve_csa(acc_pos_sum, acc_pos_carry))) / 65536.0;
+    float acc_neg = float(int(resolve_csa(acc_neg_sum, acc_neg_carry))) / 65536.0;
+    float local_sum = acc_pos - acc_neg;
+    float subgroup_sum = subgroupAdd(local_sum);
+    
+    if (subgroupElect()) {
+        s_pos[gl_SubgroupID] = subgroup_sum;
+    }
+    barrier();
+    
+    if (tid == 0u) {
+        float final_sum = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) {
+            final_sum += s_pos[i];
+        }
+        y[y_base + row] = final_sum;
+    }
+    return;
+#else
+    /* --- Positive accumulation with findLSB --- */
+    int p_start = rpp[row];
+    int p_end   = rpp[row + 1];
+    uint acc_pos_sum = 0u; uint acc_pos_carry = 0u;
+    for (int k = p_start + int(tid); k < p_end; k += 256) {
+        uint active_pos = 0u;
+        uint col = uint(pi[k]);
+        active_pos |= (1u << (col & 31u));
+        uint col_base = col & ~31u;
+        while (active_pos != 0u) {
+            int j = findLSB(active_pos);
+            csa_add(acc_pos_sum, acc_pos_carry, uint(int(x[x_base + col_base + uint(j)] * 65536.0)));
+            active_pos &= ~(1u << uint(j));
+        }
+    }
+    float acc_pos = float(int(resolve_csa(acc_pos_sum, acc_pos_carry))) / 65536.0;
+    s_pos[tid] = acc_pos;
+
+    /* --- Negative accumulation with findLSB --- */
+    int n_start = rpn[row];
+    int n_end   = rpn[row + 1];
+    uint acc_neg_sum = 0u; uint acc_neg_carry = 0u;
+    for (int k = n_start + int(tid); k < n_end; k += 256) {
+        uint active_neg = 0u;
+        uint col = uint(ni[k]);
+        active_neg |= (1u << (col & 31u));
+        uint col_base = col & ~31u;
+        while (active_neg != 0u) {
+            int j = findLSB(active_neg);
+            csa_add(acc_neg_sum, acc_neg_carry, uint(int(x[x_base + col_base + uint(j)] * 65536.0)));
+            active_neg &= ~(1u << uint(j));
+        }
+    }
+    float acc_neg = float(int(resolve_csa(acc_neg_sum, acc_neg_carry))) / 65536.0;
+    s_neg[tid] = acc_neg;
+
+    barrier();
+#endif
+
+    /* --- Parallel reduction (power-of-2 tree) --- */
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_pos[tid] += s_pos[tid + s];
+            s_neg[tid] += s_neg[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        y[y_base + row] = s_pos[0] - s_neg[0];
+    }
+}

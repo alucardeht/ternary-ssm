@@ -1,0 +1,23 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer FwdH { float fwd_h[]; };
+layout(set = 0, binding = 1) buffer BwdDh { float bwd_dh[]; };
+
+layout(push_constant) uniform Push {
+    uint total_elements;
+    float tau;
+    float discount;
+} push;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= push.total_elements) return;
+
+    float val = fwd_h[idx];
+    
+    // SPBSC: Skip gradient propagation if forward potential is extremely small
+    if (abs(val) < push.tau) {
+        bwd_dh[idx] *= push.discount;
+    }
+}

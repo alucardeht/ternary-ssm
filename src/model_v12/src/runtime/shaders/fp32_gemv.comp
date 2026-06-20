@@ -1,0 +1,69 @@
+#version 450
+
+/* FP32 Batched GEMV: y[row, batch] = sum_j A[row,j] * x[j, batch]
+ * Supports accumulate mode (y += result) and transposed mode (A^T @ x).
+ * One workgroup per (output_row, batch_item).
+ * 256 threads reduce the dot product over cols dimension.
+ * Dispatch: gridX = rows, gridY = batch_size, gridZ = 1
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer MatA { float A[]; };
+layout(set = 0, binding = 1) readonly  buffer VecX { float x[]; };
+layout(set = 0, binding = 2)           buffer VecY { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint batch_size;
+    uint x_stride;
+    uint y_stride;
+    uint accumulate;   /* 0 = overwrite, 1 = y += result */
+    uint transposed;   /* 0 = normal A[row,k], 1 = A^T: A[k,row] (column access) */
+    uint batch_offset; /* offset for split dispatches (WDDM stall prevention) */
+} pc;
+
+shared float s_acc[256];
+
+void main() {
+    uint row       = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y + pc.batch_offset;
+    uint tid       = gl_LocalInvocationID.x;
+
+    if (row >= pc.rows || batch_idx >= pc.batch_size) return;
+
+    uint x_base = batch_idx * pc.x_stride;
+    uint y_base = batch_idx * pc.y_stride;
+
+    float acc = 0.0;
+
+    if (pc.transposed == 0u) {
+        /* Normal: y[row] = sum_k A[row * cols + k] * x[k] */
+        uint a_row = row * pc.cols;
+        for (uint k = tid; k < pc.cols; k += 256u) {
+            acc += A[a_row + k] * x[x_base + k];
+        }
+    } else {
+        /* Transposed: y[row] = sum_j A[j * cols + row] * x[j]
+         * Here 'row' is the column index of A, inner loop is over A's rows */
+        for (uint j = tid; j < pc.cols; j += 256u) {
+            acc += A[j * pc.rows + row] * x[x_base + j];
+        }
+    }
+
+    s_acc[tid] = acc;
+    barrier();
+
+    /* Power-of-2 reduction */
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_acc[tid] += s_acc[tid + s];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        if (pc.accumulate == 0u)
+            y[y_base + row] = s_acc[0];
+        else
+            y[y_base + row] += s_acc[0];
+    }
+}

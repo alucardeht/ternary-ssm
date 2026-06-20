@@ -1,0 +1,116 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf {
+    uint data[];
+} weights;
+
+layout(set = 0, binding = 1) buffer ScratchBuf {
+    float data[];
+} scratch;
+
+layout(push_constant) uniform PushConstants {
+    uint out_off;
+    uint q_off;
+    uint k_cache_off;
+    uint v_cache_off;
+    uint scores_off;
+    int n_heads;
+    int head_dim;
+    int cache_len;
+    int cache_start;
+    int window_size;
+    uint scale_bits;
+} pc;
+
+shared float smem[64];
+
+void main() {
+    uint head_idx = gl_GlobalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (head_idx >= uint(pc.n_heads)) {
+        return;
+    }
+
+    float scale = uintBitsToFloat(pc.scale_bits);
+
+    uint out_base = pc.out_off / 4;
+    uint q_base = pc.q_off / 4;
+    uint k_cache_base = pc.k_cache_off / 4;
+    uint v_cache_base = pc.v_cache_off / 4;
+    uint scores_base = pc.scores_off / 4;
+
+    uint head_start = head_idx * uint(pc.head_dim);
+    uint q_head_start = q_base + head_start;
+    uint k_cache_head_start = k_cache_base + head_idx * uint(pc.cache_len) * uint(pc.head_dim);
+    uint v_cache_head_start = v_cache_base + head_idx * uint(pc.cache_len) * uint(pc.head_dim);
+
+    int window_start = max(0, pc.cache_len - pc.window_size);
+    int window_len = min(pc.cache_len, pc.window_size);
+
+    float max_score = -1e9;
+    for (int pos = window_start; pos < pc.cache_len; pos++) {
+        uint k_pos_start = k_cache_head_start + pos * uint(pc.head_dim);
+
+        float dot_product = 0.0;
+        for (int d = tid; d < pc.head_dim; d += 64) {
+            float q_val = scratch.data[q_head_start + d];
+            float k_val = scratch.data[k_pos_start + d];
+            dot_product += q_val * k_val;
+        }
+
+        smem[tid] = dot_product;
+        barrier();
+
+        for (uint s = 32; s > 0; s >>= 1) {
+            if (tid < s) {
+                smem[tid] += smem[tid + s];
+            }
+            barrier();
+        }
+
+        float score = smem[0] * scale;
+        max_score = max(max_score, score);
+
+        scratch.data[scores_base + pos] = score;
+    }
+
+    barrier();
+
+    float sum_exp = 0.0;
+    for (int pos = window_start; pos < pc.cache_len; pos++) {
+        float score = scratch.data[scores_base + pos];
+        float exp_score = exp(score - max_score);
+        scratch.data[scores_base + pos] = exp_score;
+        sum_exp += exp_score;
+    }
+
+    smem[tid] = sum_exp;
+    barrier();
+
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        barrier();
+    }
+
+    float sum_exp_total = smem[0];
+
+    for (int d = tid; d < pc.head_dim; d += 64) {
+        float out_val = 0.0;
+
+        for (int pos = window_start; pos < pc.cache_len; pos++) {
+            float attn_weight = scratch.data[scores_base + pos];
+            uint v_pos_start = v_cache_head_start + pos * uint(pc.head_dim);
+            float v_val = scratch.data[v_pos_start + d];
+            out_val += attn_weight * v_val;
+        }
+
+        out_val /= sum_exp_total;
+        scratch.data[out_base + head_start + d] = out_val;
+    }
+}

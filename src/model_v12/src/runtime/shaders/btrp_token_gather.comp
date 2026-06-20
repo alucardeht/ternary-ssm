@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufEmbed  { float embed_E[]; };
+layout(set = 0, binding = 1) readonly  buffer BufTokens { uint  tokens[];  };
+layout(set = 0, binding = 2) writeonly buffer BufOut    { float out_rows[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_embed;
+    uint vocab_size;
+    uint R;
+} pc;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint r_out = gl_LocalInvocationID.x;
+    
+    if (t >= pc.seq_len || r_out >= pc.d_embed) return;
+    
+    uint bt = b * pc.seq_len + t;
+    uint token = tokens[bt];
+
+    // BTRP Layout in embed_E:
+    // Core1: [vocab_size, R] -> offset 0
+    // Core2: [R, R] -> offset vocab_size * R
+    // Core3: [R, d_embed] -> offset vocab_size * R + R * R
+    
+    uint c1_offset = 0;
+    uint c2_offset = pc.vocab_size * pc.R;
+    uint c3_offset = c2_offset + pc.R * pc.R;
+    
+    float acc = 0.0;
+    for (uint i = 0; i < pc.R; i++) {
+        float c1_val = embed_E[c1_offset + token * pc.R + i];
+        for (uint j = 0; j < pc.R; j++) {
+            float c2_val = embed_E[c2_offset + i * pc.R + j];
+            float c3_val = embed_E[c3_offset + j * pc.d_embed + r_out];
+            acc += c1_val * c2_val * c3_val;
+        }
+    }
+    
+    out_rows[bt * pc.d_embed + r_out] = acc;
+}

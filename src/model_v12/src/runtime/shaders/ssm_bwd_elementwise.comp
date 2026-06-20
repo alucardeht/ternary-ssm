@@ -1,0 +1,104 @@
+#version 450
+
+/* SSM Backward Elementwise — compute gradients after suffix scan.
+ *
+ * Legacy output kept alive for S4 cleanup:
+ *   dA_ps[t,i] = dh[t,i] * h_prev[t,i]
+ *
+ * Active R368 M1 S3 outputs:
+ *   d_dot[t,i] = dA_ps[t,i] * A[i] * gate[t,i] * (1 - gate[t,i])
+ *   dA[i]      = sum_t(dA_ps[t,i] * gate[t,i])
+ *   db_A[i]    = sum_t(d_dot[t,i])
+ *
+ * This keeps dA_ps materialized for CPU fallback / later S4 cleanup, but the
+ * active GPU path no longer depends on that stored tensor plus a separate
+ * a_backward_dgate reduction kernel.
+ *
+ * One workgroup per state dimension i. Threads stride over linear bseq
+ * positions so the reduction contract matches the old dA_ps -> dgate pass.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufDH     { float dh[];      };
+layout(set = 0, binding = 1) readonly  buffer BufHcache { float h_cache[]; };
+layout(set = 0, binding = 2) readonly  buffer BufXcv    { float x_cv[];    };
+layout(set = 0, binding = 3) readonly  buffer BufBeff   { float B_eff[];   };
+layout(set = 0, binding = 4) readonly  buffer BufCbl    { float C_bl[];    };
+layout(set = 0, binding = 5) readonly  buffer BufAGate  { float a_eff_gate[]; };
+layout(set = 0, binding = 6) readonly  buffer BufA      { float A[];       };
+layout(set = 0, binding = 7) writeonly buffer BufDAps   { float dA_ps[];   };
+layout(set = 0, binding = 8) writeonly buffer BufDDot   { float d_dot[];   };
+layout(set = 0, binding = 9) writeonly buffer BufDB     { float dB_seq[];  };
+layout(set = 0, binding = 10)          buffer BufDXcv   { float d_x_cv[];  };
+layout(set = 0, binding = 11)          buffer BufDAOut  { float dA_out[];  };
+layout(set = 0, binding = 12)          buffer BufDbAOut { float dbA_out[]; };
+layout(set = 0, binding = 13) readonly buffer BufFactor { float norm_factor[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint batch_size;
+    uint has_bilinear;
+} pc;
+
+shared float s_acc_dA[256];
+shared float s_acc_dbA[256];
+
+void main() {
+    uint i = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (i >= pc.d_state) return;
+
+    uint bseq = pc.batch_size * pc.seq_len;
+    float a_i = A[i];
+    float acc_dA = 0.0;
+    float acc_dbA = 0.0;
+
+    for (uint pos = tid; pos < bseq; pos += 256u) {
+        uint b = pos / pc.seq_len;
+        uint t = pos - b * pc.seq_len;
+        uint base = b * pc.seq_len * pc.d_state;
+        uint idx = base + t * pc.d_state + i;
+
+        float dh_val = dh[idx];
+        float h_prev = (t > 0u) ? h_cache[base + (t - 1u) * pc.d_state + i] : 0.0;
+        float xc = x_cv[idx];
+        float gate = a_eff_gate[idx];
+        float da = dh_val * h_prev;
+        dA_ps[idx] = da;
+        acc_dA += da * gate;
+
+        float d_dot_ti = da * a_i * gate * (1.0 - gate);
+        d_dot[idx] = d_dot_ti;
+        acc_dbA += d_dot_ti;
+
+        // Q-01: Apply local cotangent energy normalization
+        float factor = norm_factor[b * pc.seq_len + t];
+        dh_val *= factor;
+
+        dB_seq[idx] = dh_val * xc;
+
+        float dx = B_eff[idx] * dh_val;
+        if (pc.has_bilinear != 0u) {
+            dx += C_bl[i] * h_prev * dh_val;
+        }
+        d_x_cv[idx] = dx;
+    }
+
+    s_acc_dA[tid] = acc_dA;
+    s_acc_dbA[tid] = acc_dbA;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_acc_dA[tid] += s_acc_dA[tid + s];
+            s_acc_dbA[tid] += s_acc_dbA[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        dA_out[i] = s_acc_dA[0];
+        dbA_out[i] = s_acc_dbA[0];
+    }
+}

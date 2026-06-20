@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer BufDH     { float d_h[];     };
+layout(set = 0, binding = 1) readonly buffer BufEmbedP { float embed_P[]; };
+layout(set = 0, binding = 2) readonly buffer BufTokens { uint  tokens[];  };
+layout(set = 0, binding = 3)          buffer BufDEE    { uint  d_embed_E[];};
+
+layout(push_constant) uniform PC {
+    uint total_positions;
+    uint d_model;
+    uint d_embed;
+};
+
+void atomicAddFloat(uint idx, float val) {
+    uint old_val = d_embed_E[idx];
+    uint new_val;
+    do {
+        float old_f = uintBitsToFloat(old_val);
+        new_val = floatBitsToUint(old_f + val);
+        uint prev = atomicCompSwap(d_embed_E[idx], old_val, new_val);
+        if (prev == old_val) return;
+        old_val = prev;
+    } while (true);
+}
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint i = gl_LocalInvocationID.x;
+    if (t >= total_positions || i >= d_embed) return;
+
+    float acc = 0.0;
+    uint dh_base = t * d_model;
+    uint ep_base = i * d_model;
+    for (uint j = 0u; j < d_model; j++)
+        acc += embed_P[ep_base + j] * d_h[dh_base + j];
+
+    // Sparse assignment directly to the output array over sequence position
+    d_embed_E[t * d_embed + i] = floatBitsToUint(acc);
+}

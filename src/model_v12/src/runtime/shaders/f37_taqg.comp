@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer ShadowBuffer { float shadow[]; };
+layout(set = 0, binding = 1) buffer GradBuffer { float grad[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint N;
+    float lr;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= N) return;
+    
+    // Ternary-Algebraic Quotient Gradients (TAQG)
+    // $g_C = n_C \cdot g_{rep} + r_C$. A target-preserving exact multiplicity quotient in $GF(3)$ proxy space.
+    
+    float g = grad[idx];
+    
+    // Map gradient to GF(3) proxy space {-1, 0, 1}
+    float g_rep = 0.0;
+    if (g > 1e-4) g_rep = 1.0;
+    else if (g < -1e-4) g_rep = -1.0;
+    
+    // Accumulate natively
+    shadow[idx] -= lr * g_rep;
+}

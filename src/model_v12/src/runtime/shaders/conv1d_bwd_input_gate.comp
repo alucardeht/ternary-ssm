@@ -1,0 +1,77 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufDXcv  { float d_x_cv[];  };
+layout(set = 0, binding = 1) readonly  buffer BufWconv { float w_conv[];  };
+layout(set = 0, binding = 2) readonly  buffer BufXproj { float x_proj[];  };
+layout(set = 0, binding = 3) readonly  buffer BufMask  { float mask_val[];};
+layout(set = 0, binding = 4) writeonly buffer BufDXp   { float d_xp[];   };
+layout(set = 0, binding = 5)           buffer BufDTau  { uint d_tau[];   };
+
+/* CAS-loop atomicAdd for float stored as uint32 */
+void atomicAddFloat(uint idx, float val) {
+    uint old_val = d_tau[idx];
+    uint new_val;
+    do {
+        float old_f = uintBitsToFloat(old_val);
+        new_val = floatBitsToUint(old_f + val);
+        uint prev = atomicCompSwap(d_tau[idx], old_val, new_val);
+        if (prev == old_val) return;
+        old_val = prev;
+    } while (true);
+}
+
+layout(push_constant) uniform PC {
+    uint  seq_len;
+    uint  d_state;
+    float tau;
+    float scale;
+};
+
+shared float s_dtau[128];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint i = gl_LocalInvocationID.x;
+    if (t >= seq_len || i >= d_state) return;
+
+    uint ds = d_state;
+    uint base = b * seq_len * ds;
+    uint idx = base + t * ds + i;
+
+    /* Conv1d transpose with causal padding boundary at t=0 */
+    float d_xgated = 0.0;
+    if (t == 0u) {
+        float d0 = d_x_cv[base + i];
+        float d1 = (seq_len > 1u) ? d_x_cv[base + 1u*ds + i] : 0.0;
+        float d2 = (seq_len > 2u) ? d_x_cv[base + 2u*ds + i] : 0.0;
+        float d3 = (seq_len > 3u) ? d_x_cv[base + 3u*ds + i] : 0.0;
+        d_xgated  = w_conv[0u*ds+i] * d0;
+        d_xgated += w_conv[1u*ds+i] * (d0 + d1);
+        d_xgated += w_conv[2u*ds+i] * (d0 + d1 + d2);
+        d_xgated += w_conv[3u*ds+i] * (d0 + d1 + d2 + d3);
+    } else {
+        for (int kk = 0; kk < 4; kk++) {
+            uint tt = t + uint(kk);
+            if (tt < seq_len)
+                d_xgated += w_conv[kk*ds+i] * d_x_cv[base + tt*ds + i];
+        }
+    }
+
+    /* Gate backward */
+    float xp = x_proj[idx];
+    float mv = mask_val[idx];
+    float m1m = mv * (1.0 - mv);
+    float sgn = (xp >= 0.0) ? 1.0 : -1.0;
+    d_xp[idx] = d_xgated * (mv + xp * scale * sgn * m1m);
+
+    /* d_tau reduction */
+    s_dtau[i] = d_xgated * xp * (-scale * m1m);
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (i < s) s_dtau[i] += s_dtau[i + s];
+        barrier();
+    }
+    if (i == 0u) atomicAddFloat(0u, s_dtau[0]);
+}

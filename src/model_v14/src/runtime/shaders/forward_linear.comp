@@ -1,0 +1,48 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufShadow { float shadow[]; };
+layout(set = 0, binding = 1) readonly buffer BufX { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint bseq;
+    float beta;
+} pc;
+
+shared float s_acc[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= pc.rows || t >= pc.bseq) return;
+
+    uint x_base = t * pc.cols;
+    uint shadow_row_base = row * pc.cols;
+
+    float acc = 0.0;
+    for (uint i = tid; i < pc.cols; i += 256) {
+        float w_shadow = shadow[shadow_row_base + i];
+        float w_val = tanh(pc.beta * w_shadow);
+        acc += w_val * x[x_base + i];
+    }
+
+    float sub_sum = subgroupAdd(acc);
+    if (subgroupElect()) {
+        s_acc[gl_SubgroupID] = sub_sum;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float final_sum = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) {
+            final_sum += s_acc[i];
+        }
+        y[t * pc.rows + row] = final_sum;
+    }
+}

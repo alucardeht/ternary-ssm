@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufMomentum { float momentum[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float ke_threshold;
+    float rescale_factor;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Kinetic Energy Rescaling
+    // Kinetic energy proxy = momentum^2
+    // If KE > threshold, rescale the gradient to avoid unstable oscillations.
+    
+    float g_val = g_in[idx];
+    float m_val = momentum[idx];
+    
+    float kinetic_energy = m_val * m_val;
+    
+    float out_g = g_val;
+    if (kinetic_energy > pc.ke_threshold) {
+        // Rescale based on how far above threshold we are.
+        // A simple soft-rescaling: target_ke / current_ke ratio or exponential decay.
+        // For this proxy, we apply the rescale_factor smoothly.
+        float scale = pc.ke_threshold / (kinetic_energy + 1e-6);
+        // Blend between 1.0 and scale using rescale_factor
+        scale = mix(1.0, scale, pc.rescale_factor);
+        out_g *= scale;
+    }
+    
+    g_out[idx] = out_g;
+}

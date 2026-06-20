@@ -1,0 +1,29 @@
+#version 450
+
+/* Q-23: Exact Multiplicity Quotient for Recurrent Micro-batches
+ * Rapid LSH deduplication kernel.
+ */
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufXcv { float x_cv[]; };
+layout(set = 0, binding = 1) writeonly buffer BufHash { uint hash_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint batch_size;
+} pc;
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= pc.seq_len * pc.batch_size) return;
+    
+    // Simple LSH hash
+    uint h = 0x811c9dc5u;
+    for (uint i = 0; i < pc.d_state; i += 4u) {
+        float val = x_cv[t * pc.d_state + i];
+        h ^= floatBitsToUint(val) >> 16u;
+        h *= 0x01000193u;
+    }
+    hash_out[t] = h;
+}

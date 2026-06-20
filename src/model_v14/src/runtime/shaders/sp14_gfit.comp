@@ -1,0 +1,51 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; };
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x[];     };
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  };
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint has_bilinear;
+} pc;
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (tid != 0u) return;
+    if (dim >= pc.d_state) return;
+
+    uint T = pc.seq_len;
+    uint batch_base = b * T * pc.d_state;
+
+    float h_prev = 0.0;
+    
+    for (uint t = 0; t < T; t++) {
+        uint idx = batch_base + t * pc.d_state + dim;
+        float base_x = x[idx];
+        float a = A_eff[idx];
+        if (pc.has_bilinear != 0u) a += C_bl[dim] * base_x;
+        
+        // GF(p) proxy: fast modulo integer ALU emulation
+        int a_int = int(exp(a) * 65536.0);
+        int bx_int = int(B_eff[idx] * base_x * 65536.0);
+        int h_prev_int = int(h_prev * 65536.0);
+        
+        // Modulo prime 8388593 (largest prime under 2^23)
+        int p = 8388593;
+        
+        // Mixed real/integer GF(p) logic to simulate ALU behavior
+        int h_new_int = ((h_prev_int * a_int) / 65536 + bx_int) % p;
+        
+        float h_new = float(h_new_int) / 65536.0;
+        
+        h_out[idx] = h_new;
+        h_prev = h_new;
+    }
+}

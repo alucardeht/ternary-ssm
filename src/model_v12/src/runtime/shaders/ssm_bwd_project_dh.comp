@@ -1,0 +1,62 @@
+#version 450
+
+/* SSM Backward dh Projection (Q-02)
+ * Projects dh orthogonal to the forward state h_t:
+ * dh_perp = dh - (dh . h_t / ||h_t||^2) h_t
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BufDH { float dh[]; };
+layout(set = 0, binding = 1) readonly buffer BufHcache { float h_cache[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+shared float s_dot_dh_h[256];
+shared float s_dot_h_h[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (t >= pc.seq_len) return;
+
+    // Notice that h_prev is used for dh[t], which corresponds to h_cache[t-1]
+    // "orthogonal to the forward state h_t": Wait, dh[t] is the gradient w.r.t h_t. So we use h_cache[t].
+    uint base = (b * pc.seq_len + t) * pc.d_state;
+    float dot_dh_h = 0.0;
+    float dot_h_h = 0.0;
+
+    for (uint i = tid; i < pc.d_state; i += 256u) {
+        float h_val = h_cache[base + i];
+        float dh_val = dh[base + i];
+        dot_dh_h += dh_val * h_val;
+        dot_h_h += h_val * h_val;
+    }
+
+    s_dot_dh_h[tid] = dot_dh_h;
+    s_dot_h_h[tid] = dot_h_h;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_dot_dh_h[tid] += s_dot_dh_h[tid + s];
+            s_dot_h_h[tid] += s_dot_h_h[tid + s];
+        }
+        barrier();
+    }
+
+    float final_dot_dh_h = s_dot_dh_h[0];
+    float final_dot_h_h = s_dot_h_h[0];
+    barrier();
+
+    float proj_scale = final_dot_dh_h / (final_dot_h_h + 1e-6);
+
+    for (uint i = tid; i < pc.d_state; i += 256u) {
+        float h_val = h_cache[base + i];
+        dh[base + i] -= proj_scale * h_val;
+    }
+}

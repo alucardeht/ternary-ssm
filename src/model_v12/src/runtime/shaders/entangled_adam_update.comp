@@ -1,0 +1,71 @@
+#version 450
+layout(local_size_x = 256) in;
+
+// Note: buffer contains uint16_t but Vulkan SL handles them as uint (arrays of 32-bit if aligned, but we can read 16-bit)
+// Actually we will bind it as uint16_t buffer if GL_EXT_shader_16bit_storage is supported.
+// To be safe and compatible, model_v12 usually binds 16-bit arrays as int16_t via GL_EXT_shader_16bit_storage
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(set = 0, binding = 0) buffer BufPacked { uint16_t packed_state[]; };
+layout(set = 0, binding = 1) readonly buffer BufGrad { float grad[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+    float lr;
+    float b1;
+    float b2;
+    float eps;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= N) return;
+    
+    uint p = uint(packed_state[idx]);
+    float g = grad[idx];
+    
+    uint w_enc = (p >> 14) & 3u;
+    float w = (w_enc == 1u) ? 1.0 : ((w_enc == 2u) ? -1.0 : 0.0);
+    
+    uint m_enc = (p >> 7) & 0x7Fu;
+    int m_signed = int(m_enc);
+    if ((m_signed & 0x40) != 0) m_signed |= 0xFFFFFF80;
+    float m = float(m_signed) / 63.0;
+    
+    uint v_enc = p & 0x7Fu;
+    float v_sqrt = float(v_enc) / 127.0;
+    float v = v_sqrt * v_sqrt;
+    
+    m = b1 * m + (1.0 - b1) * g;
+    v = b2 * v + (1.0 - b2) * g * g;
+    
+    float update = - lr * m / (sqrt(v) + eps);
+    
+    // Deterministic pseudo-random for stochastic rounding
+    uint seed = idx ^ floatBitsToUint(m) ^ floatBitsToUint(v);
+    seed = (seed ^ 61u) ^ (seed >> 16u);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4u);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15u);
+    float rand_val = float(seed) / 4294967296.0; // [0, 1)
+    
+    if (abs(update) > rand_val) {
+        w += sign(update);
+        if (w > 1.0) w = 1.0;
+        if (w < -1.0) w = -1.0;
+    }
+    
+    uint new_w_enc = (w >= 0.5) ? 1u : ((w <= -0.5) ? 2u : 0u);
+    
+    int new_m_enc = int(round(m * 63.0));
+    new_m_enc = clamp(new_m_enc, -64, 63);
+    uint new_m_bits = uint(new_m_enc) & 0x7Fu;
+    
+    int new_v_enc = int(round(sqrt(v) * 127.0));
+    new_v_enc = clamp(new_v_enc, 0, 127);
+    uint new_v_bits = uint(new_v_enc) & 0x7Fu;
+    
+    packed_state[idx] = uint16_t((new_w_enc << 14) | (new_m_bits << 7) | new_v_bits);
+}

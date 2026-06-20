@@ -1,0 +1,34 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufSpectralFlow { float spectral_flow[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float norm_epsilon;
+    float band_scale;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Spectral Flow Normalization
+    // Normalize spectral coefficients to prevent lowest frequency dominance.
+    // Proxy implementation: we assume `spectral_flow` contains pre-computed
+    // band variances or flow energies for the corresponding parameter index's frequency.
+    
+    float g_val = g_in[idx];
+    float s_flow = spectral_flow[idx];
+    
+    // The normalization factor is inversely proportional to the spectral flow energy in that band
+    float norm_factor = pc.band_scale / (sqrt(s_flow) + pc.norm_epsilon);
+    
+    // Apply normalization to the gradient
+    // Real implementation involves FFT -> Normalize -> IFFT. Here we do element-wise proxy.
+    float out_g = g_val * norm_factor;
+    
+    g_out[idx] = out_g;
+}

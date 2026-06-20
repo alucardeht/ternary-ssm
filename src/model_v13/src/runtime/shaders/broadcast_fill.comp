@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufSrc { float src[]; };  /* [d_state] */
+layout(set = 0, binding = 1) writeonly buffer BufDst { float dst[]; };  /* [total * d_state] */
+
+layout(push_constant) uniform PC {
+    uint total;    /* batch * seq_len */
+    uint d_state;
+};
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint i = gl_LocalInvocationID.x;
+    if (t >= total || i >= d_state) return;
+    dst[t * d_state + i] = src[i];
+}

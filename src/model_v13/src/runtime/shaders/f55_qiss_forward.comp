@@ -1,0 +1,52 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufContinuousState { float c_state[]; };
+layout(set = 0, binding = 1) buffer BufTernaryState { float t_state[]; };
+layout(set = 0, binding = 2) buffer BufRandom { float rand_vals[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    float temperature;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+    
+    // Quantum-Inspired Superposition Sampling
+    // Convert continuous state into probabilities for -1, 0, 1
+    // Sample based on rand_vals to simulate wave-function collapse
+    
+    for (uint t = 0; t < pc.seq_len; t++) {
+        uint offset = batch_idx * pc.d_state * pc.seq_len;
+        uint t_idx = offset + t * pc.d_state + idx;
+        
+        float val = c_state[t_idx];
+        float r = rand_vals[t_idx]; // Assuming pre-generated uniform [0, 1)
+        
+        // Softmax-like temperature scaled probabilities
+        // For simplicity, we use a piecewise or logistic mapping
+        float p_pos = 1.0 / (1.0 + exp(-(val - 0.5) / pc.temperature));
+        float p_neg = 1.0 / (1.0 + exp((val + 0.5) / pc.temperature));
+        float p_zero = 1.0 - p_pos - p_neg; // Approximation
+        
+        // In practice, ensure probabilities sum to 1
+        float sum = p_pos + p_neg + max(p_zero, 0.0);
+        p_pos /= sum;
+        p_neg /= sum;
+        
+        float sampled = 0.0;
+        if (r < p_neg) {
+            sampled = -1.0;
+        } else if (r < p_neg + p_pos) {
+            sampled = 1.0;
+        } else {
+            sampled = 0.0;
+        }
+        
+        t_state[t_idx] = sampled;
+    }
+}

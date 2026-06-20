@@ -1,0 +1,29 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BwdDh { float bwd_dh[]; };
+layout(set = 0, binding = 1) buffer FwdH { float fwd_h[]; };
+layout(set = 0, binding = 2) buffer Htr1pU { float htr1p_u[]; };
+layout(set = 0, binding = 3) buffer Htr1pV { float htr1p_v[]; };
+
+layout(push_constant) uniform Push {
+    uint total_elements;
+    float gamma;
+} push;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= push.total_elements) return;
+
+    // Simulate Laplacian lambda_min thresholding
+    float laplacian_trace_proxy = fwd_h[idx] * bwd_dh[idx];
+    
+    // Output pseudo rank-1 components if topological triviality is met
+    if (abs(laplacian_trace_proxy) > push.gamma) {
+        htr1p_u[idx] = bwd_dh[idx] * 0.5;
+        htr1p_v[idx] = fwd_h[idx] * 0.5;
+    } else {
+        htr1p_u[idx] = 0.0;
+        htr1p_v[idx] = 0.0;
+    }
+}

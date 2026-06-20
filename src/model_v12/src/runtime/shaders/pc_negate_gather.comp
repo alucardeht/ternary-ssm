@@ -1,0 +1,16 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) readonly buffer Src { float src[]; };
+layout(set=0, binding=1) writeonly buffer Dst { float dst[]; };
+layout(push_constant) uniform PC { uint batch_size; uint seq_len; uint d; };
+void main() {
+    uint idx  = gl_GlobalInvocationID.x;
+    uint T     = seq_len - 1u;
+    uint total = batch_size * T * d;
+    if (idx >= total) return;
+    uint j   = idx % d;
+    uint rem = idx / d;
+    uint t   = rem % T;
+    uint b   = rem / T;
+    dst[idx] = -src[(b * seq_len + t + 1u) * d + j];
+}

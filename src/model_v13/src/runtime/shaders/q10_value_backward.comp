@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufH { float h[]; }; // batch * seq * ds
+layout(set = 0, binding = 1) readonly buffer BufV { float V[]; }; // batch * seq
+layout(set = 0, binding = 2) readonly buffer BufLoss { float loss[]; }; // batch * seq
+layout(set = 0, binding = 3) readonly buffer BufWv { float W_V[]; }; // ds
+layout(set = 0, binding = 4) buffer BufDh { float dh[]; }; // batch * seq * ds
+layout(set = 0, binding = 5) buffer BufdWv { float dW_V[]; }; // ds
+
+layout(push_constant) uniform PC {
+    uint batch_size;
+    uint seq_len;
+    uint ds;
+    float lambda;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= ds) return;
+
+    float w_val = W_V[i];
+    float dw_acc = 0.0;
+
+    for (uint b = 0; b < batch_size; b++) {
+        for (uint s = 0; s < seq_len; s++) {
+            uint t = b * seq_len + s;
+            float v_t = V[t];
+            float l_t = loss[t];
+            float v_next = (s + 1 < seq_len) ? V[t+1] : 0.0;
+            
+            float delta = v_t - l_t - v_next;
+            
+            // dh_t += lambda * delta_t * W_V[i]
+            dh[t * ds + i] += lambda * delta * w_val;
+            
+            // dw_v += delta_t * h_t
+            dw_acc += delta * h[t * ds + i];
+        }
+    }
+    
+    dW_V[i] = dw_acc;
+}

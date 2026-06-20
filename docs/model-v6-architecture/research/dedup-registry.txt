@@ -1,0 +1,64 @@
+# Research Deduplication Registry - Round 1 Aspects 3 & 4
+
+---
+# Wave 1 - Web Research Findings
+R1-A3-F1:FlexGen-Block-Scheduled-Offloading
+R1-A3-F2:Speculative-Decoding-Ternary-Draft
+R1-A3-F3:Layer-Streaming-Unified-Memory
+R1-A3-F4:Mixture-of-Depths-MoD
+R1-A3-F5:Phase-Level-Early-Exit-AdaInfer
+R1-A3-F6:Mamba-Shedder-SSM-Pruning
+R1-A3-F7:First-Finish-Search-FFS
+R1-A3-F8:HALT-CoT-Adaptive-Early-Stopping
+
+---
+# Wave 2 - Math Derivations
+R1-A3-M1:State-Delta-Norm-Bound-Ternary
+R1-A3-M2:Ternary-State-Stabilization-Phase-Transition
+R1-A3-M3:Entropy-Gated-State-Update
+R1-A3-M4:Depth-Width-Capacity-Theorem
+R1-A3-M5:Hamming-Distance-Router-Exact
+R1-A3-M6:MDL-Routing-Kolmogorov-Optimal
+R1-A3-M7:Spectral-Decay-Ternary-Operators
+R1-A3-M8:Minimum-Viable-Ternary-Router
+R1-A3-M9:Ternary-Speculative-Decoding-Zone
+R1-A3-M10:Optimal-Memory-Hierarchy-Waterfall
+R1-A3-M11:Layer-Streaming-Crossover-Theorem
+R1-A3-M12:Expert-Prefetch-Markov-Routing
+R1-A3-M13:Fundamental-Ternary-Throughput-Ceiling
+R1-A3-M14:Unified-Memory-Zero-Copy
+R1-A3-M15:SSM-State-Expert-Cache-Predictor
+R1-A3-M16:Holographic-MoE-Expert-Compression
+
+---
+# Wave 3 - Paradigm Breakers
+R1-A3-P1:Ternary-Butterfly-Factorization
+R1-A3-P2:Resonant-SSM-Ternary-Spectral-Gating
+R1-A3-P3:Seed-Generated-Random-Projections
+R1-A3-P4:Permutation-Based-Weight-Sharing
+R1-A3-P5:SSM-Guided-Ternary-Weight-Flipping
+R1-A3-P6:Instruction-Stream-Compilation
+R1-A3-P7:Periodic-State-Automaton
+R1-A3-P8:Bitplane-POPCOUNT-Engine
+R1-A3-P9:Collapsed-Path-Network-Layer-Fusion
+R1-A3-P10:Moment-Bypass-Routing
+
+---
+# Aspect 4 - Data Pipeline Parallelization (Theme B)
+R1-A4-F1:Length-Sorted-Dynamic-Batching
+R1-A4-F2:Token-Budget-Constant-Batching
+R1-A4-F3:HuggingFace-Fast-Tokenizers-Rust
+R1-A4-F4:Pre-Tokenized-Dataset-Caching
+R1-A4-F5:Memory-Mapped-Dataset-Loading
+R1-A4-F6:Pinned-Memory-Async-Prefetch
+R1-A4-F7:Dynamic-Padding-Collate-Time
+R1-A4-F8:Conversation-Optimized-Tokenizer
+
+---
+# Summary
+Total Findings: 42
+- IMPLEMENT: 37
+- EXPLORE: 4
+- REJECT: 1
+- EXPLORE: 4
+- REJECT: 1

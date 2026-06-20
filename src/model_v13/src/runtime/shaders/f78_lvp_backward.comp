@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufLocalVar { float local_var[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float penalty_strength;
+    float epsilon;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Logarithmic Variance Penalty
+    // Throttle updates based on the log of variance to smoothly handle chaotic vs deterministic regions.
+    // penalty = 1.0 / (1.0 + penalty_strength * max(0, log(var + eps)))
+    
+    float g_val = g_in[idx];
+    float l_var = local_var[idx]; // Pre-computed or running variance
+    
+    // We want to penalize high variance smoothly.
+    // If var is small, log(var) is negative, max(0, log) is 0, penalty is 1 (no penalty).
+    // If var is large, log(var) is positive, penalty < 1 (throttles the update).
+    // To ensure log is well-behaved, we scale it appropriately.
+    // Here we assume l_var is normalized or we just offset it.
+    
+    float log_var = log(l_var + pc.epsilon);
+    // Shift log_var so we penalize above a certain threshold (e.g. log(1.0) = 0).
+    float penalty_term = max(0.0, log_var); 
+    
+    float penalty = 1.0 / (1.0 + pc.penalty_strength * penalty_term);
+    
+    float out_g = g_val * penalty;
+    
+    g_out[idx] = out_g;
+}

@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer MatA { float A[]; };
+layout(set = 0, binding = 1) readonly  buffer MatB { float B[]; };
+layout(set = 0, binding = 2)           buffer MatC { float C[]; };
+
+layout(push_constant) uniform PC {
+    uint T;
+    uint M;
+    uint N;
+    uint accumulate;
+    uint batch_offset;
+} pc;
+
+shared float s_acc[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint col = gl_WorkGroupID.y + pc.batch_offset;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= pc.M || col >= pc.N) return;
+
+    float acc = 0.0;
+    for (uint t = tid; t < pc.T; t += 256u) {
+        acc += A[t * pc.M + row] * B[t * pc.N + col];
+    }
+    s_acc[tid] = acc;
+
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_acc[tid] += s_acc[tid + s];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        uint idx = row * pc.N + col;
+        float grad_val = s_acc[0];
+        
+        // S-07: Zero-Point Orthogonal Deflation Measure
+        // Filter out gradients that are orthogonally deflated (effectively zero)
+        if (abs(grad_val) < 1e-6) {
+            grad_val = 0.0;
+        }
+
+        if (pc.accumulate == 0u)
+            C[idx] = grad_val;
+        else
+            C[idx] += grad_val;
+    }
+}

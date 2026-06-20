@@ -1,0 +1,72 @@
+#version 450
+
+/* dlm_head Gradient Scatter
+ *
+ * One workgroup per valid position (b, t) where t in [0, T-1).
+ * Total dispatch: B * (T-1) workgroups.
+ *
+ * Multiple positions can share the same vocab token (same dlm_head row),
+ * so concurrent writes from different workgroups require atomic operations.
+ * VK_EXT_shader_atomic_float may be unavailable; we use a CAS loop on
+ * uint32 with floatBitsToUint / uintBitsToFloat reinterpretation instead.
+ *
+ * For each candidate sample s at this position:
+ *   1. Read d_logit scalar from DLogits[pos * n_samples + s].
+ *   2. Look up the vocab row index from SampleIDs[pos * n_samples + s].
+ *   3. For each column j (strided across 256 threads):
+ *        dlm_head[v * d_model + j] += dg * norm_out[(b*T + t) * d_model + j]
+ *
+ * dlm_head is declared as uint[] so atomicCompSwap is legal; the host
+ * reinterprets the buffer as float after the dispatch completes.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufSampleIDs { uint  sample_ids[]; };
+layout(set = 0, binding = 1) readonly buffer BufDLogits   { float d_logits[];   };
+layout(set = 0, binding = 2) readonly buffer BufNormOut   { float norm_out[];   };
+layout(set = 0, binding = 3)          buffer BufDLMHead   { uint  dlm_head[];   };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_model;
+    uint n_samples;
+    uint batch_size;
+} pc;
+
+void atomicAddFloat(uint idx, float val) {
+    uint old_val = dlm_head[idx];
+    uint new_val;
+    do {
+        float old_f  = uintBitsToFloat(old_val);
+        new_val      = floatBitsToUint(old_f + val);
+        uint prev    = atomicCompSwap(dlm_head[idx], old_val, new_val);
+        if (prev == old_val) return;
+        old_val = prev;
+    } while (true);
+}
+
+void main() {
+    uint pos = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint total_positions = pc.batch_size * (pc.seq_len - 1u);
+    if (pos >= total_positions) return;
+
+    uint b      = pos / (pc.seq_len - 1u);
+    uint t      = pos % (pc.seq_len - 1u);
+    uint h_base = (b * pc.seq_len + t) * pc.d_model;
+
+    for (uint s = 0u; s < pc.n_samples; s++) {
+        float dg = d_logits[pos * pc.n_samples + s];
+
+        if (abs(dg) < 1e-12) continue;
+
+        uint v        = sample_ids[pos * pc.n_samples + s];
+        uint dlm_base = v * pc.d_model;
+
+        for (uint j = tid; j < pc.d_model; j += 256u) {
+            float val = dg * norm_out[h_base + j];
+            atomicAddFloat(dlm_base + j, val);
+        }
+    }
+}

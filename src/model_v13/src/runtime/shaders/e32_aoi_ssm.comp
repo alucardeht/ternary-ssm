@@ -1,0 +1,83 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; };
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x[];     };
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  };
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint has_bilinear;
+} pc;
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (tid != 0u) return;
+
+    uint half_d = pc.d_state / 2u;
+    if (dim >= half_d) return;
+
+    uint T = pc.seq_len;
+    uint batch_base = b * T * pc.d_state;
+
+    float q_curr = 0.0;
+    float p_curr = 0.0;
+
+    // Forward pass to get final state
+    for (uint t = 0; t < T; t++) {
+        uint idx_q = batch_base + t * pc.d_state + dim;
+        uint idx_p = batch_base + t * pc.d_state + dim + half_d;
+
+        float beta_q = A_eff[idx_q];
+        if (pc.has_bilinear != 0u) beta_q += C_bl[dim] * x[idx_q];
+        
+        float beta = clamp(beta_q, -3.14159265, 3.14159265);
+        float cb = cos(beta);
+        float sb = sin(beta);
+
+        float x_q = B_eff[idx_q] * x[idx_q];
+        float x_p = B_eff[idx_p] * x[idx_p];
+
+        // SO(d) rotation: A_t = [cb, -sb; sb, cb]
+        float q_new = q_curr * cb - p_curr * sb + x_q;
+        float p_new = q_curr * sb + p_curr * cb + x_p;
+
+        q_curr = q_new;
+        p_curr = p_new;
+    }
+
+    // Exact unrolling backward
+    for (int t = int(T) - 1; t >= 0; t--) {
+        uint idx_q = batch_base + uint(t) * pc.d_state + dim;
+        uint idx_p = batch_base + uint(t) * pc.d_state + dim + half_d;
+        
+        h_out[idx_q] = q_curr;
+        h_out[idx_p] = p_curr;
+        
+        float beta_q = A_eff[idx_q];
+        if (pc.has_bilinear != 0u) beta_q += C_bl[dim] * x[idx_q];
+        
+        float beta = clamp(beta_q, -3.14159265, 3.14159265);
+        float cb = cos(beta);
+        float sb = sin(beta);
+
+        float x_q = B_eff[idx_q] * x[idx_q];
+        float x_p = B_eff[idx_p] * x[idx_p];
+
+        float q_hat = q_curr - x_q;
+        float p_hat = p_curr - x_p;
+        
+        // Inverse is A_t^T = [cb, sb; -sb, cb]
+        float q_prev = q_hat * cb + p_hat * sb;
+        float p_prev = -q_hat * sb + p_hat * cb;
+        
+        q_curr = q_prev;
+        p_curr = p_prev;
+    }
+}

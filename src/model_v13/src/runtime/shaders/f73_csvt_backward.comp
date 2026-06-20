@@ -1,0 +1,36 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufLocalVar { float local_var[]; };
+layout(set = 0, binding = 3) buffer BufBlockVar { float block_var[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float alpha; // mixing coefficient
+    float epsilon;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Cross-Scale Variance Tracking
+    // Normalize gradient updates using a multi-scale context (local vs block variance).
+    // g_out = g_in / sqrt(alpha * local_var + (1-alpha) * block_var + epsilon)
+    
+    float g_val = g_in[idx];
+    float l_var = local_var[idx];
+    
+    // Here we assume block_var contains a single value or an array mapped to blocks.
+    // For simplicity of this proxy shader, we'll map it 1-to-1 or use a broadcasted value.
+    // Assuming block_var is populated per-parameter with its respective block variance.
+    float b_var = block_var[idx]; 
+    
+    float mixed_var = pc.alpha * l_var + (1.0 - pc.alpha) * b_var;
+    
+    float out_g = g_val * inversesqrt(mixed_var + pc.epsilon);
+    
+    g_out[idx] = out_g;
+}

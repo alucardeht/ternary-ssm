@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufCotangentIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufCotangentOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    float alpha; // fractional order
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+    
+    // Fractional Laplacian Adjoint Diffusion
+    // Apply a simplified fractional diffusion convolution to the gradient sequence
+    // to allow credit to jump across distant tokens via heavy-tailed power law.
+    
+    // For architectural compliance in a fast compute shader, we apply a sliding window
+    // with heavy-tailed decay weights.
+    
+    for (uint t = 0; t < pc.seq_len; t++) {
+        float diffused_g = 0.0;
+        float norm = 0.0;
+        
+        // Look back into the future (since it's backward pass, future token gradients diffuse backward)
+        for (uint tau = t; tau < min(t + 16, pc.seq_len); tau++) {
+            float dist = float(tau - t) + 1.0;
+            // Power law decay: w = 1 / dist^(1 + alpha)
+            float w = 1.0 / pow(dist, 1.0 + pc.alpha);
+            
+            diffused_g += w * g_in[batch_idx * pc.d_state * pc.seq_len + tau * pc.d_state + idx];
+            norm += w;
+        }
+        
+        // Conserve energy
+        g_out[batch_idx * pc.d_state * pc.seq_len + t * pc.d_state + idx] = diffused_g / norm;
+    }
+}

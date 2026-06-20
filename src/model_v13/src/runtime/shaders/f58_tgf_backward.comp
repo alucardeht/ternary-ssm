@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufParam { float param[]; };
+layout(set = 0, binding = 2) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float torsion_scale;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Torsional Gradient Flow (Non-Symmetric Connection)
+    // We add an anti-symmetric twist to the gradient based on the parameter's neighbor
+    // or phase, effectively rotating the gradient slightly off the direct steepest descent path.
+    // This torsion helps escape saddle points in discrete/ternary landscapes.
+    
+    float g_val = g_in[idx];
+    
+    // Simple torsion proxy: mix gradient with the gradient of an adjacent parameter
+    // (creating a pseudo-curl or rotation)
+    float g_adj = 0.0;
+    if (idx > 0 && idx < pc.param_size - 1) {
+        g_adj = g_in[idx + 1] - g_in[idx - 1]; // Anti-symmetric difference
+    } else if (idx == 0 && pc.param_size > 1) {
+        g_adj = g_in[1] - g_in[0];
+    } else if (idx == pc.param_size - 1 && pc.param_size > 1) {
+        g_adj = g_in[idx] - g_in[idx - 1];
+    }
+    
+    // Add the torsional twist
+    float torsional_g = g_val + pc.torsion_scale * g_adj;
+    
+    g_out[idx] = torsional_g;
+}

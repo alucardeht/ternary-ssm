@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer A_eff { float A[]; };
+layout(set = 0, binding = 1) readonly buffer B_eff { float B[]; };
+layout(set = 0, binding = 2) readonly buffer X_in { float X[]; };
+layout(set = 0, binding = 3) buffer H_buf { float H[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.d_state) return;
+    
+    for (int t = int(pc.seq_len) - 1; t > 0; t--) {
+        uint curr_idx = t * pc.d_state + idx;
+        uint prev_idx = (t - 1) * pc.d_state + idx;
+        
+        float h_t = H[curr_idx];
+        float a_t = A[curr_idx];
+        float b_t = B[curr_idx];
+        float x_t = X[curr_idx];
+        
+        float h_prev = (h_t - b_t * x_t) / (a_t + 1e-8);
+        H[prev_idx] = h_prev;
+    }
+}

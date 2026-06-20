@@ -1,0 +1,20 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer BufH { float h[]; }; // batch * seq * ds
+layout(set = 0, binding = 1) readonly buffer BufWv { float W_V[]; }; // ds
+layout(set = 0, binding = 2) buffer BufV { float V[]; }; // batch * seq
+
+layout(push_constant) uniform PC {
+    uint bseq;
+    uint ds;
+};
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= bseq) return;
+    float sum = 0.0;
+    for (uint i = 0; i < ds; i++) {
+        sum += h[t * ds + i] * W_V[i];
+    }
+    V[t] = sum;
+}

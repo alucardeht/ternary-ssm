@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufH { float h[]; };
+layout(set = 0, binding = 1) writeonly buffer BufSum { float sum[]; };
+
+layout(push_constant) uniform PC {
+    uint bseq;
+    uint ds;
+    uint K;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint num_blocks = pc.bseq / pc.K;
+    if (idx >= num_blocks * pc.ds) return;
+    
+    uint block = idx / pc.ds;
+    uint d = idx % pc.ds;
+    
+    float s = 0.0;
+    float alpha = 0.95; // Galois Ring characteristic proxy
+    float current_alpha = alpha;
+    
+    for (uint j = 0; j < pc.K; j++) {
+        uint t = block * pc.K + j;
+        s += current_alpha * h[t * pc.ds + d];
+        current_alpha *= alpha;
+    }
+    
+    sum[idx] = s;
+}

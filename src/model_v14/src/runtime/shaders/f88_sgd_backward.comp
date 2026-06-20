@@ -1,0 +1,38 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufGradVariance { float grad_variance[]; };
+layout(set = 0, binding = 3) buffer BufRandom { float random_vals[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float max_drop_prob;
+    float variance_scale;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Stochastic Gradient Dropping
+    // Drop gradients with probability proportional to historical variance.
+    
+    float g_val = g_in[idx];
+    float var = grad_variance[idx];
+    float rand_val = random_vals[idx]; // Pre-generated random values [0, 1)
+    
+    // Probability of dropping is proportional to variance.
+    float drop_prob = min(pc.max_drop_prob, var * pc.variance_scale);
+    
+    float out_g = g_val;
+    if (rand_val < drop_prob) {
+        out_g = 0.0;
+    } else {
+        // Optional: rescale remaining gradients to maintain expected value
+        // out_g = g_val / (1.0 - drop_prob);
+    }
+    
+    g_out[idx] = out_g;
+}

@@ -1,0 +1,35 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float smoothing_weight;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Local Entropic Smoothing
+    // Apply a lightweight local smoothing filter over gradients of adjacent parameters.
+    
+    float current_g = g_in[idx];
+    
+    // Simple 1D neighbor smoothing (boundary conditions handled by clamping)
+    uint idx_left = (idx > 0) ? idx - 1 : idx;
+    uint idx_right = (idx < pc.param_size - 1) ? idx + 1 : idx;
+    
+    float left_g = g_in[idx_left];
+    float right_g = g_in[idx_right];
+    
+    // Smooth the gradient using neighbors
+    float smoothed_g = (left_g + current_g + right_g) / 3.0;
+    
+    // Blend the original and smoothed based on smoothing_weight
+    float out_g = (1.0 - pc.smoothing_weight) * current_g + pc.smoothing_weight * smoothed_g;
+    
+    g_out[idx] = out_g;
+}

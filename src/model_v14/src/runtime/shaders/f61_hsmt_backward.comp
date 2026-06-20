@@ -1,0 +1,57 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufParam { float param[]; };
+layout(set = 0, binding = 2) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float sphere_radius;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Hyper-Spherical Metric Tensor
+    // We compute a localized scaling factor (a simplified diagonal metric) based on
+    // the distance to the ideal hyper-sphere radius.
+    // If the parameter magnitude is far from the sphere radius, the update is scaled
+    // to push it tangentially or re-normalize it to the sphere surface.
+    
+    float g_val = g_in[idx];
+    float p_val = param[idx];
+    
+    float current_r = abs(p_val) + 1e-8;
+    
+    // Simple metric component: penalize radial movement, encourage tangential movement.
+    // If r is near sphere_radius, metric is near 1.
+    // We adjust the effective learning rate (via gradient scaling) 
+    // to enforce spherical constraint.
+    
+    float radial_dist = abs(current_r - pc.sphere_radius);
+    
+    // The metric tensor scaling factor. 
+    // This is a proxy for multiplying the gradient by the inverse metric tensor.
+    // We want to amplify corrections when far from the sphere (or dampen, depending on formulation).
+    // Here we dampen movement that points radially outward if we're outside the sphere.
+    
+    float scale = 1.0;
+    
+    // Projection of gradient onto radial direction: (g * p) / |p|
+    float radial_g = (g_val * p_val) / current_r;
+    
+    // If we are outside the sphere and moving outwards, dampen the radial component
+    if (current_r > pc.sphere_radius && radial_g * p_val > 0.0) {
+        scale = exp(-radial_dist);
+        g_val -= radial_g * (1.0 - scale) * (p_val / current_r);
+    }
+    // If we are inside and moving inwards, dampen
+    else if (current_r < pc.sphere_radius && radial_g * p_val < 0.0) {
+        scale = exp(-radial_dist);
+        g_val -= radial_g * (1.0 - scale) * (p_val / current_r);
+    }
+    
+    g_out[idx] = g_val;
+}

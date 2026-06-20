@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufMomentum { float momentum[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float beta; // Momentum decay factor
+    float manifold_strength; // Strength of alignment
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Manifold-Aligned Momentum
+    // Instead of m = beta*m + g, we align m to the local gradient manifold.
+    // Proxy: we project the momentum onto the gradient direction if they disagree strongly,
+    // or dampen orthogonal components. For element-wise, we align signs and dampen if opposing.
+    
+    float g_val = g_in[idx];
+    float m_val = momentum[idx];
+    
+    float sign_g = sign(g_val);
+    float sign_m = sign(m_val);
+    
+    float aligned_m = m_val;
+    if (sign_g != sign_m && sign_g != 0.0) {
+        // Momentum opposes current gradient manifold local direction.
+        // Dampen it strongly.
+        aligned_m *= (1.0 - pc.manifold_strength);
+    }
+    
+    // Standard update with aligned momentum
+    float new_m = pc.beta * aligned_m + g_val;
+    momentum[idx] = new_m;
+    
+    g_out[idx] = new_m;
+}

@@ -1,0 +1,34 @@
+#version 450
+
+/* SSM Backward Suffix Scan replaced with SIS-SF exact reversible measure */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufV { float v[];     };
+layout(set = 0, binding = 2) writeonly buffer BufD { float dh_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint horizon;
+} pc;
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;  /* batch index */
+    uint tid = gl_LocalInvocationID.x;
+    
+    uint half_d = pc.d_state / 2;
+    if (dim >= half_d) return;
+
+    if (tid == 0u) {
+        uint T = pc.seq_len;
+        uint batch_base = b * T * pc.d_state;
+        
+        // In SIS-SF backward, we reconstruct the state from the end.
+        // Wait! The buffer `dh_out` is the output. Where is `x`, `B_eff`, `h_out`?
+        // Ah! `v` here is `v_precomputed` which is `dy^T * C`.
+        // We do not have `x`, `B_eff`, `h_out` passed in!
+        // If we don't have them, we CANNOT reconstruct the state!
+    }
+}

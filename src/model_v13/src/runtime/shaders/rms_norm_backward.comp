@@ -1,0 +1,60 @@
+#version 450
+
+/* RMS Norm Backward: transform d_out -> d_h in-place
+ * d_h[t,j] = norm_w[j] * (d_out[t,j] - h_normed[t,j] * dot_scaled) * inv_rms
+ * where dot_scaled = (1/d) * sum_j(h_normed[t,j] * d_out[t,j])
+ *
+ * One workgroup per timestep (512). 256 threads reduce dot product.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufHfinal { float h_final[]; };
+layout(set = 0, binding = 1)           buffer BufDout   { float d_out[];   };  /* in/out */
+layout(set = 0, binding = 2) readonly  buffer BufRms    { float rms[];     };
+layout(set = 0, binding = 3) readonly  buffer BufNormW  { float norm_w[];  };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d;
+} pc;
+
+shared float s_dot[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;  /* batch index */
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= pc.seq_len) return;
+
+    uint base = (b * pc.seq_len + t) * pc.d;
+    float inv_rms = 1.0 / rms[b * pc.seq_len + t];
+    uint ept = pc.d / 256u;
+
+    /* Phase 1: dot = sum_j (h_normed_j * d_out_j) */
+    float local_dot = 0.0;
+    for (uint e = 0u; e < ept; e++) {
+        uint j = tid * ept + e;
+        if (j < pc.d) {
+            local_dot += (h_final[base + j] * inv_rms) * d_out[base + j];
+        }
+    }
+    s_dot[tid] = local_dot;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_dot[tid] += s_dot[tid + s];
+        barrier();
+    }
+
+    float dot_scaled = s_dot[0] / float(pc.d);
+
+    /* Phase 2: d_h[t,j] = norm_w[j] * (d_out[t,j] - h_normed_j * dot_scaled) / rms */
+    /* norm_w is per-dimension weight vector shared across batch */
+    for (uint e = 0u; e < ept; e++) {
+        uint j = tid * ept + e;
+        if (j < pc.d) {
+            float h_normed_j = h_final[base + j] * inv_rms;
+            d_out[base + j] = norm_w[j] * (d_out[base + j] - h_normed_j * dot_scaled) * inv_rms;
+        }
+    }
+}

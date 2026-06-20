@@ -1,0 +1,63 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer HCache { float h_cache[]; };
+layout(set = 0, binding = 1) buffer Aux { float aux[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    uint batch_size;
+} pc;
+
+#define PI 3.1415926535897932384626433832795
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total_threads = pc.batch_size * pc.d_state;
+    if (idx >= total_threads) return;
+
+    uint b = idx / pc.d_state;
+    uint d = idx % pc.d_state;
+    
+    uint seq_stride = pc.d_state;
+    uint base_offset = b * pc.seq_len * pc.d_state + d;
+    
+    uint aux_offset = b * pc.seq_len * pc.d_state * 2 + d * 2;
+    uint aux_stride = pc.d_state * 2;
+    
+    // 1. DFT
+    for (uint k = 0; k < pc.seq_len; k++) {
+        float re = 0.0;
+        float im = 0.0;
+        for (uint t = 0; t < pc.seq_len; t++) {
+            float x = h_cache[base_offset + t * seq_stride];
+            float angle = -2.0 * PI * float(k * t) / float(pc.seq_len);
+            re += x * cos(angle);
+            im += x * sin(angle);
+        }
+        
+        // 2. Isolate low-frequency energy (drop top 50%)
+        // The real DFT is symmetric. Low frequencies are near 0 and N.
+        // If we drop top 50% frequencies, we zero out k from seq_len/4 to 3*seq_len/4.
+        if (k > pc.seq_len / 4 && k < pc.seq_len - pc.seq_len / 4) {
+            re = 0.0;
+            im = 0.0;
+        }
+        
+        aux[aux_offset + k * aux_stride]     = re;
+        aux[aux_offset + k * aux_stride + 1] = im;
+    }
+    
+    // 3. IDFT
+    for (uint t = 0; t < pc.seq_len; t++) {
+        float re = 0.0;
+        for (uint k = 0; k < pc.seq_len; k++) {
+            float X_re = aux[aux_offset + k * aux_stride];
+            float X_im = aux[aux_offset + k * aux_stride + 1];
+            float angle = 2.0 * PI * float(k * t) / float(pc.seq_len);
+            re += X_re * cos(angle) - X_im * sin(angle);
+        }
+        h_cache[base_offset + t * seq_stride] = re / float(pc.seq_len);
+    }
+}

@@ -1,0 +1,14 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer In { float in_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float out_data[]; };
+layout(push_constant) uniform PC { uint B; uint T; uint D; } pc;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.B * pc.T * pc.D) return;
+    uint b = idx / (pc.T * pc.D);
+    uint rem = idx % (pc.T * pc.D);
+    uint t = rem / pc.D;
+    uint d = rem % pc.D;
+    out_data[b * (pc.D * pc.T) + d * pc.T + t] = in_data[idx];
+}

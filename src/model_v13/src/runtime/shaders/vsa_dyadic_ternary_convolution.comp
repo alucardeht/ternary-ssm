@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InData {
+    float in_data[];
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightData {
+    float weight_data[];
+};
+
+layout(set = 0, binding = 2) buffer OutData {
+    float out_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_tokens;
+    uint ds; // MUST be a power of 2
+} p;
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    if (token_idx >= p.num_tokens) return;
+    
+    uint local_idx = gl_LocalInvocationID.x;
+    uint base_idx = token_idx * p.ds;
+    
+    // Dyadic Ternary Convolution in the Walsh-Hadamard sequency domain.
+    // We multiply the token embedding by a global ternary weight vector.
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        float x = in_data[base_idx + i];
+        float w = weight_data[i]; // Global filter
+        
+        // Ensure weight is ternary {-1, 0, 1}
+        float w_ternary = sign(w) * step(0.5, abs(w));
+        
+        out_data[base_idx + i] = x * w_ternary;
+    }
+}

@@ -1,0 +1,67 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer HCacheBuf {
+    float h_cache[];
+};
+
+layout(std430, binding = 1) readonly buffer DLogitsBuf {
+    float d_logits[];
+};
+
+layout(std430, binding = 2) buffer ScoreMomentsBuf {
+    float moments[];
+};
+
+layout(push_constant) uniform Params {
+    uint batch_size;
+    uint seq_len;
+    uint d_state;
+    uint n_samples;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint valid_seq = pc.seq_len > 0u ? pc.seq_len - 1u : 0u;
+    uint total_positions = pc.batch_size * valid_seq;
+
+    if (i < pc.d_state) {
+        float signed_acc = moments[i];
+        float abs_acc = moments[pc.d_state + i];
+
+        for (uint pos = 0u; pos < total_positions; ++pos) {
+            uint b = valid_seq > 0u ? pos / valid_seq : 0u;
+            uint t = valid_seq > 0u ? pos - b * valid_seq : 0u;
+            uint h_idx = (b * pc.seq_len + t) * pc.d_state + i;
+            float residual_score = -d_logits[pos * pc.n_samples];
+            float contrib = residual_score * h_cache[h_idx];
+            signed_acc += contrib;
+            abs_acc += abs(contrib);
+        }
+
+        moments[i] = signed_acc;
+        moments[pc.d_state + i] = abs_acc;
+    }
+
+    if (i == 0u) {
+        uint stats_base = 2u * pc.d_state;
+        float count = moments[stats_base + 0u];
+        float score_sum = moments[stats_base + 1u];
+        float score_abs_sum = moments[stats_base + 2u];
+        float score_sq_sum = moments[stats_base + 3u];
+
+        for (uint pos = 0u; pos < total_positions; ++pos) {
+            float residual_score = -d_logits[pos * pc.n_samples];
+            count += 1.0;
+            score_sum += residual_score;
+            score_abs_sum += abs(residual_score);
+            score_sq_sum += residual_score * residual_score;
+        }
+
+        moments[stats_base + 0u] = count;
+        moments[stats_base + 1u] = score_sum;
+        moments[stats_base + 2u] = score_abs_sum;
+        moments[stats_base + 3u] = score_sq_sum;
+    }
+}

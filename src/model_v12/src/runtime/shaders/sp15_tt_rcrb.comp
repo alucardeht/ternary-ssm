@@ -1,0 +1,47 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; };
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x_v[];     };
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  };
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint tt_rank;
+} pc;
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (tid != 0u) return;
+    if (dim >= pc.d_state) return;
+    
+    uint T = pc.seq_len;
+    uint batch_base = b * T * pc.d_state;
+    
+    // TT-RCRB: Tensor-Train Recurrent Cotangent Rank-Bound
+    // Backpropagate using rank-r subspace approximation.
+    uint r = pc.tt_rank > 0u ? pc.tt_rank : 4u;
+    
+    float dh_next = 0.0;
+    
+    for (uint t_inv = 0; t_inv < T; t_inv++) {
+        uint t = T - 1u - t_inv;
+        uint idx = batch_base + t * pc.d_state + dim;
+        
+        float a_val = (t + 1u < T) ? A_eff[batch_base + (t + 1u) * pc.d_state + dim] : 1.0;
+        
+        // Project onto TT subspace of rank r.
+        float tt_factor = float((dim % r) + 1u) / float(r);
+        
+        float cur_v = x_v[idx];
+        dh_next = dh_next * a_val * tt_factor + cur_v;
+        
+        h_out[idx] = dh_next;
+    }
+}

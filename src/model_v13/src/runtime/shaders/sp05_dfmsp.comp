@@ -1,0 +1,34 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufW { float weights[]; };
+layout(set = 0, binding = 1) writeonly buffer BufDeltaW { float delta_weights[]; };
+
+layout(push_constant) uniform PC {
+    uint total_elements;
+    uint seed;
+} pc;
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total_elements) return;
+
+    uint h = hash(idx ^ pc.seed);
+    float perturb = 0.0;
+    
+    // Choose {-1, 0, 1}
+    uint choice = h % 10;
+    if (choice == 0) perturb = -1.0;
+    else if (choice == 1) perturb = 1.0;
+    
+    delta_weights[idx] = perturb;
+}

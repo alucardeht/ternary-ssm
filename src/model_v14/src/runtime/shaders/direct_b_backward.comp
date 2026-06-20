@@ -1,0 +1,62 @@
+#version 450
+
+/* Direct-B backward — fused batch reduction + dB accumulation + d_x_cv update
+ *
+ * Replaces three CPU loops:
+ *   1. batch reduction of dB_seq[batch*seq*ds] → dB_per_t[seq*ds]
+ *   2. dB[i] += sum_{b,t}( dB_seq[b,t,i] * sigmoid(x_cv[b,t,i]) )
+ *   3. d_x_cv[b,t,i] += dB_seq[b,t,i] * B[i] * dsigmoid(x_cv[b,t,i])
+ *
+ * The CPU formulation first reduced dB_seq across batches, then used the
+ * reduced values.  Mathematically the two are equivalent:
+ *   dB[i] = sum_{b,t}( dB_seq[b,t,i] * sig(x_cv[b,t,i]) )  — same result.
+ *
+ * Dispatch: (seq_len, batch_size, 1), local_size (128, 1, 1)
+ * One workgroup = one (t, b) pair; 128 threads cover all d_state elements.
+ *
+ * dB_accum is a uint buffer used for CAS-based float atomics so the
+ * per-state accumulation is race-free across all workgroups.
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufDBseq  { float dB_seq[];   };  /* [batch*seq*ds] */
+layout(set = 0, binding = 1) readonly buffer BufXcv    { float x_cv[];     };  /* [batch*seq*ds] */
+layout(set = 0, binding = 2) readonly buffer BufBvec   { float B_vec[];    };  /* [ds] */
+layout(set = 0, binding = 3)          buffer BufDxcv   { float d_x_cv[];   };  /* [batch*seq*ds] rw */
+layout(set = 0, binding = 4)          buffer BufDBaccum { uint dB_accum[]; };  /* [ds] CAS atomic */
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint batch_size;
+};
+
+void atomicAddFloat(uint idx, float val) {
+    uint assumed;
+    uint old_val = dB_accum[idx];
+    do {
+        assumed = old_val;
+        float old_f  = uintBitsToFloat(assumed);
+        uint  new_u  = floatBitsToUint(old_f + val);
+        old_val = atomicCompSwap(dB_accum[idx], assumed, new_u);
+    } while (old_val != assumed);
+}
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint i = gl_LocalInvocationID.x;
+
+    if (t >= seq_len || b >= batch_size || i >= d_state) return;
+
+    uint flt_idx = (b * seq_len + t) * d_state + i;
+
+    float db   = dB_seq[flt_idx];
+    float xc   = x_cv[flt_idx];
+    float sig  = 1.0 / (1.0 + exp(-xc));
+    float dsig = sig * (1.0 - sig);
+
+    d_x_cv[flt_idx] += db * B_vec[i] * dsig;
+
+    atomicAddFloat(i, db * sig);
+}

@@ -1,0 +1,29 @@
+#version 450
+
+/* Q-27: Interior Cotangent Tube Sparse Settlement
+ * Boundary-statistic analytic resolution for sequential backward loop,
+ * with sparse scatter-add for tokens with high CE impulse.
+ */
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufHcache { float h_cache[]; };
+layout(set = 0, binding = 1) buffer BufDps { float dA_ps[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    float ce_threshold;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    
+    // Analytic boundary settlement proxy
+    // dA_ps is conditionally updated sparsely based on CE impulse magnitude
+    if (idx < pc.seq_len * pc.d_state) {
+        float h_val = h_cache[idx];
+        if (abs(h_val) > pc.ce_threshold) {
+            dA_ps[idx] += 0.001 * h_val; // Sparse scatter-add for high CE impulse
+        }
+    }
+}

@@ -1,0 +1,53 @@
+#version 450
+
+/* Conv1d weight gradient: d_conv_w[kk,i] = sum_{b,t} d_x_cv[b,t,i] * x_gated[b,max(t-kk,0),i]
+ *
+ * Dispatch: gridX = K*d_state (4*128=512), gridY = 1
+ * 256 threads reduce over batch*T dimension per (kk, i) pair
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufDXcv   { float d_x_cv[];  };
+layout(set = 0, binding = 1) readonly  buffer BufXgated { float x_gated[]; };
+layout(set = 0, binding = 2) writeonly buffer BufDW     { float d_conv_w[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint K;
+    uint batch_size;
+} pc;
+
+shared float s_acc[256];
+
+void main() {
+    uint flat_id = gl_WorkGroupID.x;  /* 0..K*d_state-1 */
+    uint tid = gl_LocalInvocationID.x;
+
+    uint kk = flat_id / pc.d_state;
+    uint i  = flat_id % pc.d_state;
+
+    if (kk >= pc.K || i >= pc.d_state) return;
+
+    /* Reduce over batch * T */
+    float acc = 0.0;
+    uint total = pc.batch_size * pc.seq_len;
+    for (uint bt = tid; bt < total; bt += 256u) {
+        uint b_idx = bt / pc.seq_len;
+        uint t     = bt % pc.seq_len;
+        uint batch_base = b_idx * pc.seq_len * pc.d_state;
+        uint src_t = (t >= kk) ? (t - kk) : 0u;
+        acc += d_x_cv[batch_base + t * pc.d_state + i] * x_gated[batch_base + src_t * pc.d_state + i];
+    }
+    s_acc[tid] = acc;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_acc[tid] += s_acc[tid + s];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        d_conv_w[kk * pc.d_state + i] = s_acc[0];
+    }
+}

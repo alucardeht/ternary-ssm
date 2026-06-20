@@ -1,0 +1,52 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufQuery { float Q[]; };
+layout(set = 0, binding = 1) buffer BufKey { float K[]; };
+layout(set = 0, binding = 2) buffer BufValue { float V[]; };
+layout(set = 0, binding = 3) buffer BufOut { float Out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_head;
+    uint n_heads;
+    uint window_size; // representing a covering scale
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x; // maps to d_head
+    uint t = gl_GlobalInvocationID.y; // maps to seq_len
+    uint head = gl_GlobalInvocationID.z; // maps to n_heads
+    
+    if (idx >= pc.d_head || t >= pc.seq_len || head >= pc.n_heads) return;
+    
+    // Topos-Theoretic Grothendieck Topology on Attention
+    // Evaluate attention within a localized topological "covering" (window).
+    // Different heads can be mapped to different topologies/coverings,
+    // we simulate a sieve or covering by restricting the KV context window
+    // specifically based on the head index, creating a hierarchy of scales.
+    
+    uint current_window = pc.window_size * (head + 1); // hierarchical scale
+    
+    float q_val = Q[(head * pc.seq_len + t) * pc.d_head + idx];
+    
+    // Compute restricted attention score (unscaled, un-softmaxed for this simplified shader)
+    // Real implementation would do full dot product, here we simulate the localized pooling
+    
+    float aggregated_v = 0.0;
+    float total_score = 0.0;
+    
+    // Sieve evaluation
+    uint start_tau = (t > current_window) ? (t - current_window) : 0;
+    
+    for (uint tau = start_tau; tau <= t; tau++) {
+        float k_val = K[(head * pc.seq_len + tau) * pc.d_head + idx];
+        float v_val = V[(head * pc.seq_len + tau) * pc.d_head + idx];
+        
+        float score = exp(q_val * k_val); // simplified self-dot
+        aggregated_v += score * v_val;
+        total_score += score;
+    }
+    
+    Out[(head * pc.seq_len + t) * pc.d_head + idx] = aggregated_v / max(total_score, 1e-5);
+}

@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { float B[]; };
+layout(set = 0, binding = 2) buffer BufShadow { float shadow[]; };
+layout(set = 0, binding = 3) buffer BufGradAccum { float grad_accum[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint bseq;
+    float lr;
+};
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    uint c = gl_GlobalInvocationID.y;
+    if (r >= rows || c >= cols) return;
+    
+    float dw = 0.0;
+    uint stride_a = rows;
+    uint stride_b = cols;
+    
+    for (uint t = 0; t < bseq; t++) {
+        dw += A[t * stride_a + r] * B[t * stride_b + c];
+    }
+    
+    uint idx = r * cols + c;
+    float s = shadow[idx];
+    
+    float accum = 0.9 * grad_accum[idx] + dw;
+    if (abs(accum) < 65504.0) {
+        accum = unpackHalf2x16(packHalf2x16(vec2(accum, 0.0))).x;
+    }
+    grad_accum[idx] = accum;
+    
+    shadow[idx] = s - lr * accum;
+}

@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer HCache { float h_cache[]; };
+layout(set = 0, binding = 1) buffer VelocityGate { uint skip_flags[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    float eps_vel;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.d_state) return;
+
+    for (uint t = 1; t < pc.seq_len - 1; t++) {
+        uint idx_prev = (t - 1) * pc.d_state + gid;
+        uint idx_curr = t * pc.d_state + gid;
+        uint idx_next = (t + 1) * pc.d_state + gid;
+        
+        float v_prev = h_cache[idx_prev];
+        float v_next = h_cache[idx_next];
+        
+        float velocity = abs(v_next - v_prev);
+        
+        if (velocity < pc.eps_vel) {
+            float k1 = v_next - v_prev;
+            float h_interp = v_prev + 0.5 * k1;
+            h_cache[idx_curr] = h_interp;
+        }
+    }
+}

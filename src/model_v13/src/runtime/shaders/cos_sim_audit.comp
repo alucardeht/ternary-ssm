@@ -1,0 +1,44 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { float B[]; };
+layout(set = 0, binding = 2) buffer BufStats { int stats[]; }; // 3 elements: dot_AB, norm_A_sq, norm_B_sq
+
+layout(push_constant) uniform PC {
+    uint N;
+} pc;
+
+void atomicAddFloat(uint slot, float delta) {
+    int expected;
+    int desired;
+    bool exchanged;
+    do {
+        expected = stats[slot];
+        desired = floatBitsToInt(intBitsToFloat(expected) + delta);
+        int prev = atomicCompSwap(stats[slot], expected, desired);
+        exchanged = (prev == expected);
+    } while (!exchanged);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    
+    float a = (idx < pc.N) ? A[idx] : 0.0;
+    float b = (idx < pc.N) ? B[idx] : 0.0;
+    
+    float dot_ab = a * b;
+    float norm_a = a * a;
+    float norm_b = b * b;
+    
+    float sub_dot = subgroupAdd(dot_ab);
+    float sub_na = subgroupAdd(norm_a);
+    float sub_nb = subgroupAdd(norm_b);
+    
+    if (subgroupElect()) {
+        atomicAddFloat(0, sub_dot);
+        atomicAddFloat(1, sub_na);
+        atomicAddFloat(2, sub_nb);
+    }
+}

@@ -1,0 +1,62 @@
+{
+  "meta": {
+    "name": "overnight-001",
+    "date": "2026-03-28",
+    "description": "First v12 C overnight — joint GD, LR=3e-4, 18K steps, no checkpoint (I/O bug)",
+    "based_on": null,
+    "research_refs": ["R331", "R335", "R344"],
+    "notes": "18K steps was a PROJECTION not validated empirically. LR=3e-4 is standard Adam, not natural gradient."
+  },
+  "model": {
+    "n_layers": 6,
+    "d_model": 1024,
+    "d_state": 128,
+    "d_embed": 128,
+    "n_heads": 16,
+    "vocab_size": 32064,
+    "seq_len": 512,
+    "conv_kernel": 4,
+    "mtp_rank": 20,
+    "mtp_k": 4
+  },
+  "training": {
+    "mode": "joint_gd",
+    "total_steps": 18000,
+    "lr_max": 0.0003,
+    "lr_min_factor": 0.01,
+    "warmup_steps": 500,
+    "schedule": "cosine"
+  },
+  "optimizer": {
+    "type": "factored_adam",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8,
+    "grad_clip_norm": 1.0,
+    "weight_decay": 0.0
+  },
+  "features": {
+    "ema_sprt_gamma": 0.9,
+    "ema_sprt_threshold": 0.01,
+    "crystallization_tau": 4.6,
+    "k_hot": 2000,
+    "sampled_softmax_k": 50,
+    "gp_kl_beta": 0.01,
+    "contraction_beta": 0.01,
+    "mtp_weight": 0.3,
+    "lambda_aux": 0.0,
+    "repack_interval": 500,
+    "soft_boundary_scale": 10.0
+  },
+  "data": {
+    "dataset": "data/chat_combined/train.bin"
+  },
+  "hardware": {
+    "vulkan_enabled": true,
+    "openmp_threads": 8
+  },
+  "checkpointing": {
+    "save_every": 500,
+    "path": "DISABLED — I/O bug, ran without checkpoints"
+  }
+}

@@ -1,0 +1,37 @@
+#version 450
+
+/* Q-20: Curvature-Bounded Quantization Steps
+ * Power Iteration step.
+ */
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufW { float W[]; };
+layout(set = 0, binding = 1) buffer BufV { float v[]; };
+layout(set = 0, binding = 2) buffer BufU { float u[]; };
+layout(set = 0, binding = 3) buffer BufNorm { float norm_out[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint mode; // 0 = U = W * V, 1 = V = W^T * U
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    
+    if (pc.mode == 0u) {
+        if (i >= pc.rows) return;
+        float dot = 0.0;
+        for (uint j = 0; j < pc.cols; j++) {
+            dot += W[i * pc.cols + j] * v[j];
+        }
+        u[i] = dot;
+    } else {
+        if (i >= pc.cols) return;
+        float dot = 0.0;
+        for (uint j = 0; j < pc.rows; j++) {
+            dot += W[j * pc.cols + i] * u[j];
+        }
+        v[i] = dot;
+    }
+}

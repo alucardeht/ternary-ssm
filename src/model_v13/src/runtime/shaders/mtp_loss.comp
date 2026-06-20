@@ -1,0 +1,144 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer BufH     { float h_mtp[]; };   /* [bseq * d_state] */
+layout(set = 0, binding = 1) readonly buffer BufU     { float mtp_U[]; };   /* [d_state * rank] row-major: U[i*rank+r] */
+layout(set = 0, binding = 2) readonly buffer BufV     { float mtp_V[]; };   /* [d_state * rank] row-major: V[i*rank+r] */
+layout(set = 0, binding = 3) readonly buffer BufA     { float A_vec[]; };   /* [d_state] */
+layout(set = 0, binding = 4)          buffer BufDU    { uint  d_mtp_U[]; }; /* [d_state * rank] CAS atomic */
+layout(set = 0, binding = 5)          buffer BufDV    { uint  d_mtp_V[]; }; /* [d_state * rank] CAS atomic */
+layout(set = 0, binding = 6)          buffer BufDYssm { float d_y_ssm[]; }; /* [bseq * d_state] */
+layout(set = 0, binding = 7)          buffer BufLoss  { uint  loss_acc[]; };/* [1] CAS atomic */
+
+layout(push_constant) uniform PC {
+    uint  seq_len;
+    uint  d_state;
+    uint  mtp_k;
+    uint  rank;
+    float mtp_weight;
+};
+
+/* Shared memory declared at function scope (GLSL requirement) */
+shared float s_partial[128];
+shared float s_eu[128];
+shared float s_Vh[32];
+shared float s_err_u[32];
+
+void atomicAddFloat_u(uint idx, float val) {
+    uint old_val = d_mtp_U[idx];
+    uint new_val;
+    do {
+        new_val = floatBitsToUint(uintBitsToFloat(old_val) + val);
+        uint prev = atomicCompSwap(d_mtp_U[idx], old_val, new_val);
+        if (prev == old_val) return;
+        old_val = prev;
+    } while (true);
+}
+
+void atomicAddFloat_v(uint idx, float val) {
+    uint old_val = d_mtp_V[idx];
+    uint new_val;
+    do {
+        new_val = floatBitsToUint(uintBitsToFloat(old_val) + val);
+        uint prev = atomicCompSwap(d_mtp_V[idx], old_val, new_val);
+        if (prev == old_val) return;
+        old_val = prev;
+    } while (true);
+}
+
+void atomicAddFloat_loss(float val) {
+    uint old_val = loss_acc[0];
+    uint new_val;
+    do {
+        new_val = floatBitsToUint(uintBitsToFloat(old_val) + val);
+        uint prev = atomicCompSwap(loss_acc[0], old_val, new_val);
+        if (prev == old_val) return;
+        old_val = prev;
+    } while (true);
+}
+
+void main() {
+    uint pos = gl_WorkGroupID.x;
+    uint i   = gl_LocalInvocationID.x;
+
+    uint valid_per_batch = seq_len - mtp_k;
+    uint b       = pos / valid_per_batch;
+    uint t       = pos % valid_per_batch;
+    uint base_t  = b * seq_len + t;
+    uint target_t = b * seq_len + t + mtp_k;
+
+    float h_t_i      = (i < d_state) ? h_mtp[base_t  * d_state + i] : 0.0;
+    float h_target_i = (i < d_state) ? h_mtp[target_t * d_state + i] : 0.0;
+
+    /* Step 1: Vh[r] = sum_j V[j*rank+r] * h_t[j]  for r = 0..rank-1 */
+    for (uint r = 0u; r < rank; r++) {
+        s_partial[i] = (i < d_state) ? (mtp_V[i * rank + r] * h_t_i) : 0.0;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (i < s) s_partial[i] += s_partial[i + s];
+            barrier();
+        }
+        if (i == 0u) s_Vh[r] = s_partial[0];
+        barrier();
+    }
+
+    /* Step 2: h_pred[i] = A[i]^k * h_t[i] + sum_r U[i*rank+r] * Vh[r] */
+    float a_k = 1.0;
+    if (i < d_state) {
+        float a_i = A_vec[i];
+        for (uint kk = 0u; kk < mtp_k; kk++) a_k *= a_i;
+    }
+
+    float pred = 0.0;
+    if (i < d_state) {
+        pred = a_k * h_t_i;
+        for (uint r = 0u; r < rank; r++) pred += mtp_U[i * rank + r] * s_Vh[r];
+    }
+
+    /* Step 3: Error and loss */
+    float err = (i < d_state) ? (pred - h_target_i) : 0.0;
+    float w2  = 2.0 * mtp_weight / float(d_state);
+
+    if (i < d_state) {
+        atomicAddFloat_loss(err * err);
+    }
+
+    /* Step 4: d_mtp_U[i,r] += w2 * err * Vh[r] */
+    if (i < d_state) {
+        for (uint r = 0u; r < rank; r++) {
+            atomicAddFloat_u(i * rank + r, w2 * err * s_Vh[r]);
+        }
+    }
+
+    /* Step 5: s_err_u[r] = sum_j err[j] * U[j,r] via reduction */
+    for (uint r = 0u; r < rank; r++) {
+        s_eu[i] = (i < d_state) ? (err * mtp_U[i * rank + r]) : 0.0;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (i < s) s_eu[i] += s_eu[i + s];
+            barrier();
+        }
+        if (i == 0u) s_err_u[r] = s_eu[0];
+        barrier();
+    }
+
+    /* Step 6: d_mtp_V[i,r] += w2 * s_err_u[r] * h_t[i] */
+    if (i < d_state) {
+        for (uint r = 0u; r < rank; r++) {
+            atomicAddFloat_v(i * rank + r, w2 * s_err_u[r] * h_t_i);
+        }
+    }
+
+    /* Step 7: Gradient injection into d_y_ssm
+     * d_y_ssm[target_t, i] += w2 * (-err)       (gradient to h_target)
+     * d_y_ssm[base_t,   i] += w2 * err * a_k    (gradient to h_t via A^k)
+     */
+    if (i < d_state) {
+        d_y_ssm[target_t * d_state + i] += w2 * (-err);
+        float uv_grad = 0.0;
+        for (uint r = 0u; r < rank; r++) {
+            uv_grad += mtp_V[i * rank + r] * s_err_u[r];
+        }
+        d_y_ssm[base_t   * d_state + i] += w2 * (err * a_k + uv_grad);
+    }
+}

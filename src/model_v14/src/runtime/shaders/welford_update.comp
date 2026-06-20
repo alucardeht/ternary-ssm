@@ -1,0 +1,111 @@
+#version 450
+
+/* Welford online statistics update for GP-KL moment accumulators.
+ *
+ * Replaces the CPU loop:
+ *   for (b=0..batch_size) for (t=0..seq_len)
+ *     gp_kl_welford_update(&L->moments, h_cache + (b*seq_len+t)*ds, ds);
+ *
+ * and eliminates the h_cache GPU→CPU download that was required solely
+ * for this update.
+ *
+ * GPU buffer layout (all float, ds = d_state = 128 at runtime):
+ *   [0         .. ds-1    ]  mean[ds]
+ *   [ds        .. 2ds-1   ]  M2[ds]
+ *   [2ds       .. 3ds-1   ]  lag1_sum[ds]
+ *   [3ds       .. 4ds-1   ]  lag1_prev[ds]
+ *   [4ds                  ]  n  (reinterpreted as float via bit-cast; cast to uint for int arithmetic)
+ *   [4ds+1                ]  stability_sum
+ *   [4ds+2     .. 4ds+33  ]  orth_sum[32]
+ *   [4ds+34    .. 4ds+65  ]  orth_pair_a[32]  (float-encoded uint indices)
+ *   [4ds+66    .. 4ds+97  ]  orth_pair_b[32]  (float-encoded uint indices)
+ *
+ * Dispatch: 1 workgroup, local_size_x=128 (one thread per d_state dimension).
+ * batch*seq_len timesteps are processed sequentially per thread.
+ * Threads 0-31 additionally handle one orthogonality pair each.
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufH  { float h_cache[]; };
+layout(set = 0, binding = 1)          buffer BufM  { float moments[]; };
+
+layout(push_constant) uniform PC {
+    uint batch_size;
+    uint seq_len;
+    uint d_state;
+};
+
+#define OFF_MEAN        0u
+#define OFF_M2          128u
+#define OFF_LAG1_SUM    256u
+#define OFF_LAG1_PREV   384u
+#define OFF_N           512u
+#define OFF_STAB        513u
+#define OFF_ORTH        514u
+#define OFF_ORTH_PAIR_A 546u
+#define OFF_ORTH_PAIR_B 578u
+
+shared float s_diff_sq[128];
+
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    if (i >= d_state) return;
+
+    float my_mean      = moments[OFF_MEAN      + i];
+    float my_M2        = moments[OFF_M2        + i];
+    float my_lag1_sum  = moments[OFF_LAG1_SUM  + i];
+    float my_lag1_prev = moments[OFF_LAG1_PREV + i];
+
+    uint base_n = floatBitsToUint(moments[OFF_N]);
+
+    uint total = batch_size * seq_len;
+    uint k_updates = 0u;
+
+    for (uint bt = 0u; bt < total; bt++) {
+        if ((bt % seq_len) % 4u != 0u) {
+            continue;
+        }
+        k_updates++;
+
+        float x = h_cache[bt * d_state + i];
+
+        float n_new = float(base_n + k_updates);
+        float delta  = x - my_mean;
+        my_mean     += delta / n_new;
+        float delta2 = x - my_mean;
+        my_M2       += delta * delta2;
+
+        if (base_n + k_updates > 1u) {
+            my_lag1_sum += x * my_lag1_prev;
+
+            float diff = x - my_lag1_prev;
+            s_diff_sq[i] = diff * diff;
+            barrier();
+            if (i == 0u) {
+                float sum = 0.0;
+                for (uint j = 0u; j < d_state; j++) sum += s_diff_sq[j];
+                moments[OFF_STAB] += sum;
+            }
+            barrier();
+        }
+
+        my_lag1_prev = x;
+
+        if (i < 32u) {
+            uint a_idx = uint(moments[OFF_ORTH_PAIR_A + i]);
+            uint b_idx = uint(moments[OFF_ORTH_PAIR_B + i]);
+            float dot = h_cache[bt * d_state + a_idx] * h_cache[bt * d_state + b_idx];
+            moments[OFF_ORTH + i] += dot * dot;
+        }
+        barrier();
+    }
+
+    moments[OFF_MEAN      + i] = my_mean;
+    moments[OFF_M2        + i] = my_M2;
+    moments[OFF_LAG1_SUM  + i] = my_lag1_sum;
+    moments[OFF_LAG1_PREV + i] = my_lag1_prev;
+
+    if (i == 0u) {
+        moments[OFF_N] = uintBitsToFloat(base_n + k_updates);
+    }
+}

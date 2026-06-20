@@ -1,0 +1,21 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufEmbed  { float embed_E[]; };
+layout(set = 0, binding = 1) readonly  buffer BufTokens { uint  tokens[];  };
+layout(set = 0, binding = 2) writeonly buffer BufOut    { float out_rows[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_embed;
+} pc;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;  /* batch index */
+    uint r = gl_LocalInvocationID.x;
+    if (t >= pc.seq_len || r >= pc.d_embed) return;
+    uint bt = b * pc.seq_len + t;
+    out_rows[bt * pc.d_embed + r] = embed_E[tokens[bt] * pc.d_embed + r];
+}

@@ -1,0 +1,50 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import time
+import math
+import json
+import contextlib
+import copy
+import os
+from pathlib import Path
+from typing import Optional, Callable
+from .model import ModelV2
+from .config import ModelConfig
+from .data import get_dataloader, CurriculumSampler
+from .components.router import MoDRouter
+from .components.optim import CPUOffloadOptimizer, compute_layer_alphas, compute_lr_multipliers
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+try:
+    from liger_kernel.transformers import LigerCrossEntropyLoss
+    _LIGER_AVAILABLE = True
+except ImportError:
+    _LIGER_AVAILABLE = False
+
+
+class TrainingMonitor:
+    """Tracks training metrics for analysis."""
+
+    def __init__(self):
+        self.history = {
+            'step': [], 'loss': [], 'lr': [], 'tokens_per_sec': [],
+            'grad_norm': [], 'epoch': [],
+        }
+        self.router_history = {}
+        self.ternary_history = {}
+
+    def log(self, step: int, **kwargs):
+        for key, value in kwargs.items():
+            if key not in self.history:
+                self.history[key] = []
+            self.history[key].append(value)
+
+    def save(self, path: str):
+        with open(path, 'w') as f:
+            json.dump(self.history, f, indent=2)

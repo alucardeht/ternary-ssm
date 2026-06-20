@@ -1,0 +1,104 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float B_eff[]; };
+layout(set = 0, binding = 2) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 3) readonly  buffer BufV { float v[]; }; // C^T dy
+layout(set = 0, binding = 4) writeonly buffer BufDh { float dh_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint batch_size;
+} pc;
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint half_d = pc.d_state / 2;
+    if (dim >= half_d) return;
+
+    if (tid == 0u) {
+        uint T = pc.seq_len;
+        uint batch_base = b * T * pc.d_state;
+        
+        // We drop caching, so we start from zero final state
+        // (Assuming sequence padding boundary at end)
+        float q_n = 0.0;
+        float p_n = 0.0;
+
+        float dp_n = 0.0;
+        float dq_n = 0.0;
+
+        for (int t = int(T) - 1; t >= 0; t--) {
+            uint idx_q = batch_base + t * pc.d_state + dim;
+            uint idx_p = batch_base + t * pc.d_state + dim + half_d;
+            
+            float w_q = A_eff[idx_q];
+            float w_x = B_eff[idx_q];
+            float m_inv = A_eff[idx_p];
+            float x_val = x[idx_q];
+            
+            float dt_val = 1.0;
+
+            float v1 = w_q * q_n + w_x * x_val;
+            float tanh_v1 = tanh(v1);
+            float g1 = -w_q * (1.0 - tanh_v1 * tanh_v1);
+            float p_half = p_n + (dt_val * 0.5) * g1;
+
+            float q_p = q_n - dt_val * m_inv * p_half;
+
+            float v0 = w_q * q_p + w_x * x_val;
+            float tanh_v0 = tanh(v0);
+            float g0 = -w_q * (1.0 - tanh_v0 * tanh_v0);
+            float p_p = p_half + (dt_val * 0.5) * g0;
+
+            // Output projection gradient:
+            float dy_c_q = v[idx_q];
+            float dy_c_p = v[idx_p];
+            dq_n += dy_c_q;
+            dp_n += dy_c_p;
+
+            float dp_half = dp_n;
+            float dg1 = -(dt_val * 0.5) * dp_n;
+
+            float dw_q = dg1 * (-(1.0 - tanh_v1 * tanh_v1));
+            float dtanh_v1 = dg1 * (2.0 * w_q * tanh_v1);
+            float dv1 = dtanh_v1 * (1.0 - tanh_v1 * tanh_v1);
+
+            dw_q += dv1 * q_n;
+            float dq_n_acc = dq_n + dv1 * w_q;
+
+            float dq_p = dq_n_acc;
+            float dm_inv = dq_n_acc * (dt_val * p_half);
+            dp_half += dq_n_acc * (dt_val * m_inv);
+
+            float dp_p = dp_half;
+            float dg0 = -(dt_val * 0.5) * dp_half;
+
+            dw_q += dg0 * (-(1.0 - tanh_v0 * tanh_v0));
+            float dtanh_v0 = dg0 * (2.0 * w_q * tanh_v0);
+            float dv0 = dtanh_v0 * (1.0 - tanh_v0 * tanh_v0);
+
+            dw_q += dv0 * q_p;
+            dq_p += dv0 * w_q;
+
+            if (t > 0) {
+                uint prev_idx_q = batch_base + (t - 1) * pc.d_state + dim;
+                uint prev_idx_p = batch_base + (t - 1) * pc.d_state + dim + half_d;
+                dh_out[prev_idx_q] = dq_p;
+                dh_out[prev_idx_p] = dp_p;
+            }
+
+            q_n = q_p;
+            p_n = p_p;
+            dq_n = dq_p;
+            dp_n = dp_p;
+        }
+    }
+}

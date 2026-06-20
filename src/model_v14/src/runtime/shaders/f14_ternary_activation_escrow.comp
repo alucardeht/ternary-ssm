@@ -1,0 +1,26 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufFwdH { float fwd_h[]; };
+layout(set = 0, binding = 1) buffer BufDH { float dh_in[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint batch_size;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total_elements = pc.batch_size * pc.seq_len * pc.d_state;
+    
+    if (idx >= total_elements) return;
+
+    // Ternary Activation Escrow:
+    // If the forward activation is firmly saturated (>= 1.0 or <= -1.0)
+    // we effectively escrow it by dropping its cotangent update.
+    float h = fwd_h[idx];
+    if (abs(h) >= 0.999f) {
+        dh_in[idx] = 0.0f;
+    }
+}

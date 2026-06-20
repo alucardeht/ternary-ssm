@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.d
+*.dll
+*.exp
+*.lib
+
+# Compiled shaders (rebuild from source)
+*.spv
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.npy
+*.gguf
+
+# Training data (download separately, see README)
+data/
+
+# Training outputs
+runs/
+results/
+checkpoints/
+experiments/
+debug/
+
+# Environment
+.env
+.env.local
+
+# LaTeX compilation artifacts
+*.aux
+*.bbl
+*.blg
+*.out
+papers/**/*.log

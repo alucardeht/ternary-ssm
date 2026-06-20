@@ -1,0 +1,42 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufDh { float dh[]; };
+layout(set = 0, binding = 1) writeonly buffer BufDx { float dx[]; };
+
+layout(push_constant) uniform PC {
+    uint total_elements;
+} pc;
+
+shared float shared_jacobians[256];
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total_elements) return;
+
+    uint warp_id = gl_SubgroupID;
+    uint lane_id = gl_SubgroupInvocationID;
+    uint local_id = gl_LocalInvocationID.x;
+
+    // Odd warps compute local Jacobian
+    if ((warp_id % 2) != 0) {
+        float local_j = dh[idx] * 0.95; // Math proxy for local Jacobian
+        shared_jacobians[local_id] = local_j;
+    }
+    
+    barrier();
+
+    // Even warps consume them into associative linear scan
+    if ((warp_id % 2) == 0) {
+        // Read from the adjacent odd warp
+        uint target_local_id = local_id + gl_SubgroupSize;
+        float val = 0.0;
+        if (target_local_id < 256) {
+            val = shared_jacobians[target_local_id];
+        }
+        dx[idx] = val; // Math proxy for associative linear scan
+    }
+}

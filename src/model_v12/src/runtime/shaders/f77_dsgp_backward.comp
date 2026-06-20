@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufSpectralGrad { float spectral_g[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float spectral_learning_rate;
+    float spatial_learning_rate;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Dual-Space Gradient Projection
+    // Optimize parameters in primary space and a dual spectral space simultaneously.
+    // Proxy: we assume `spectral_g` contains the gradient component corresponding
+    // to the spectral representation of this parameter (or an approximated low-frequency component).
+    // We combine the spatial gradient and the spectral gradient based on their respective learning rates.
+    
+    float g_val = g_in[idx];
+    float s_val = spectral_g[idx];
+    
+    // The effective update is a combination of spatial update and spectral update.
+    // For this proxy shader, we simply blend them to form the final projected gradient.
+    float out_g = (pc.spatial_learning_rate * g_val + pc.spectral_learning_rate * s_val) / 
+                  (pc.spatial_learning_rate + pc.spectral_learning_rate + 1e-6);
+    
+    g_out[idx] = out_g;
+}

@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufCurvatureDiag { float curvature_diag[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float curvature_scale;
+    float epsilon;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Loss-Landscape Curvature Normalization
+    // Normalize updates inversely proportional to the estimated diagonal of the Hessian.
+    
+    float g_val = g_in[idx];
+    float curv = curvature_diag[idx]; // Proxy: pre-computed or running curvature estimate
+    
+    // We want inversely proportional to curvature:
+    // If curvature is high (steep), step size is smaller.
+    // If curvature is low (flat), step size is larger.
+    float norm_factor = pc.curvature_scale / (abs(curv) + pc.epsilon);
+    
+    float out_g = g_val * norm_factor;
+    
+    g_out[idx] = out_g;
+}

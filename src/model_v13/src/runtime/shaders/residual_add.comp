@@ -1,0 +1,16 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer VecX { float x[]; };
+layout(set = 0, binding = 1)           buffer VecY { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+    y[idx] += x[idx];
+}

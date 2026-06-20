@@ -1,0 +1,151 @@
+#version 450
+layout(local_size_x = 256) in;
+
+/* Holographic Gradient Components (U, V, S) */
+layout(set = 0, binding = 0) readonly buffer BufU       { float holo_U[];  };
+layout(set = 0, binding = 13) readonly buffer BufV      { float holo_V[];  };
+layout(set = 0, binding = 14) readonly buffer BufS      { float holo_S[];  };
+layout(set = 0, binding = 1) readonly buffer BufShadow  { float shadow[];  };
+layout(set = 0, binding = 2) readonly buffer BufSampled { float sampled[]; };
+
+/* EMA gradient accumulator (read-write: EMA update in-place) */
+layout(set = 0, binding = 3) buffer BufGradAccum { float grad_accum[]; };
+
+/* Row/col gradient sum and squared-sum accumulators.
+ * Stored as int bits (floatBitsToInt) so atomicExchange CAS works.
+ * Caller must clear to 0 (= 0.0f in IEEE 754) before dispatch.        */
+layout(set = 0, binding = 4) buffer BufGRow  { int g_row_bits[];  };
+layout(set = 0, binding = 5) buffer BufGCol  { int g_col_bits[];  };
+layout(set = 0, binding = 6) buffer BufGqRow { int gq_row_bits[]; };
+layout(set = 0, binding = 7) buffer BufGqCol { int gq_col_bits[]; };
+
+/* Row/col alive-element counters (cleared to 0 before dispatch) */
+layout(set = 0, binding = 8) buffer BufCntRow { int cnt_row[]; };
+layout(set = 0, binding = 9) buffer BufCntCol { int cnt_col[]; };
+layout(set = 0, binding = 10) readonly buffer BufRowMap { int row_map[]; };
+layout(set = 0, binding = 11) buffer BufEvidenceStats { int evidence_stats[]; };
+
+layout(push_constant) uniform PC {
+    uint  rows;
+    uint  cols;
+    uint  N;
+    uint  row_map_mode;
+    float crystallization_tau;
+    float bi_ste_factor;
+    float ema_gamma;
+    float ema_threshold;
+    uint  evidence_gate;
+    float boundary_eps;
+    uint  rank;
+};
+
+const uint STAT_ELEMENTS = 0u;
+const uint STAT_NONZERO = 1u;
+const uint STAT_CRYSTAL = 2u;
+const uint STAT_ACTIVE = 3u;
+const uint STAT_FAILED = 4u;
+const uint STAT_SIGN_STABLE = 5u;
+const uint STAT_SIGN_CONFLICT = 6u;
+const uint STAT_BOUNDARY = 7u;
+const uint STAT_MODE = 30u;
+const uint STAT_GATE = 31u;
+
+/* Atomic float add via CAS loop (standard Vulkan pattern for float atomics
+ * without VK_EXT_shader_atomic_float).                                    */
+void atomicAddFloat(uint buf_selector, uint slot, float delta) {
+    int expected;
+    int desired;
+    bool exchanged;
+    do {
+        if (buf_selector == 0u) {
+            expected = g_row_bits[slot];
+        } else if (buf_selector == 1u) {
+            expected = g_col_bits[slot];
+        } else if (buf_selector == 2u) {
+            expected = gq_row_bits[slot];
+        } else {
+            expected = gq_col_bits[slot];
+        }
+        desired = floatBitsToInt(intBitsToFloat(expected) + delta);
+        if (buf_selector == 0u) {
+            int prev = atomicCompSwap(g_row_bits[slot], expected, desired);
+            exchanged = (prev == expected);
+        } else if (buf_selector == 1u) {
+            int prev = atomicCompSwap(g_col_bits[slot], expected, desired);
+            exchanged = (prev == expected);
+        } else if (buf_selector == 2u) {
+            int prev = atomicCompSwap(gq_row_bits[slot], expected, desired);
+            exchanged = (prev == expected);
+        } else {
+            int prev = atomicCompSwap(gq_col_bits[slot], expected, desired);
+            exchanged = (prev == expected);
+        }
+    } while (!exchanged);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= N) return;
+    bool erc_on = (evidence_stats[STAT_GATE] != 0);
+    if (erc_on) atomicAdd(evidence_stats[STAT_ELEMENTS], 1);
+
+    uint r = idx / cols;
+    uint c = idx % cols;
+    int row_slot = (row_map_mode != 0u) ? row_map[r] : int(r);
+    if (row_slot < 0) return;
+    uint rs = uint(row_slot);
+
+    float s = shadow[idx];
+
+    // Q-12: Histogram
+    int q = (s > 0.5) ? 1 : ((s < -0.5) ? -1 : 0);
+    if (q == 1) atomicAdd(evidence_stats[21], 1);
+    else if (q == -1) atomicAdd(evidence_stats[23], 1);
+    else atomicAdd(evidence_stats[22], 1);
+    // sp19 Holographic Matrix Recomputation: $g_W = U V^T + S_{ternary}$
+    // Materialize dynamically at L1 cache level
+    float holo_grad = holo_S[idx];
+    for (uint k = 0; k < rank; k++) {
+        holo_grad += holo_U[r * rank + k] * holo_V[k * cols + c];
+    }
+    float dw = holo_grad;
+    if (abs(s) > crystallization_tau) {
+        if (erc_on) atomicAdd(evidence_stats[STAT_CRYSTAL], 1);
+        // Q-15: Symmetric Cotangent Reflection at Ternary Boundaries
+        dw = -dw * 0.1;
+    } else {
+        if (erc_on && abs(abs(s) - 0.5) <= boundary_eps) {
+            atomicAdd(evidence_stats[STAT_BOUNDARY], 1);
+        }
+    }
+    if (dw == 0.0) return;
+    if (erc_on) atomicAdd(evidence_stats[STAT_NONZERO], 1);
+
+    float eff_dw = (sampled[idx] == 0.0) ? (dw * bi_ste_factor) : dw;
+
+    float accum = ema_gamma * grad_accum[idx] + eff_dw;
+    // S-22: Error-Bounded Lossy Gradient Accumulation
+    // Quantize gradient accumulators to FP16 ranges. 
+    // Defer to FP32 only when exponent clipping risks divergence (accum > 65504.0)
+    if (abs(accum) < 65504.0) {
+        accum = unpackHalf2x16(packHalf2x16(vec2(accum, 0.0))).x;
+    }
+    grad_accum[idx] = accum;
+    if (erc_on) {
+        float align = accum * eff_dw;
+        if (align > 0.0) atomicAdd(evidence_stats[STAT_SIGN_STABLE], 1);
+        if (align < 0.0) atomicAdd(evidence_stats[STAT_SIGN_CONFLICT], 1);
+    }
+    if (abs(accum) <= ema_threshold) {
+        if (erc_on) atomicAdd(evidence_stats[STAT_FAILED], 1);
+        return;
+    }
+    if (erc_on) atomicAdd(evidence_stats[STAT_ACTIVE], 1);
+
+    atomicAddFloat(0u, rs, eff_dw);
+    atomicAddFloat(1u, c, eff_dw);
+    atomicAddFloat(2u, rs, eff_dw * eff_dw);
+    atomicAddFloat(3u, c, eff_dw * eff_dw);
+    atomicAdd(cnt_row[rs], 1);
+    atomicAdd(cnt_col[c], 1);
+}

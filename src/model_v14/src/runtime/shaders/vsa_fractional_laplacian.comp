@@ -1,0 +1,55 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuffer {
+    float data_in[];
+};
+
+layout(set = 0, binding = 1) readonly buffer AlphaBuffer {
+    float alpha_in[]; // Fractional exponent predicted per-token
+};
+
+layout(set = 0, binding = 2) buffer OutBuffer {
+    float data_out[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_tokens;
+    uint ds; // MUST be a power of 2
+} p;
+
+shared float shared_real[4096];
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    if (token_idx >= p.num_tokens) return;
+    
+    uint local_idx = gl_LocalInvocationID.x;
+    uint base_idx = token_idx * p.ds;
+    float alpha = alpha_in[token_idx]; // A3 metric exponent
+    
+    // 1. Load into shared memory
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        shared_real[i] = data_in[base_idx + i];
+    }
+    barrier();
+    
+    // 2. Fractional Laplacian Spectral Modulator
+    // In a real 2D spatial engine, this would be an FFT -> multiply by (k^2)^(alpha) -> IFFT.
+    // For our 1D discrete Hadamard space proxy, we emulate the fractional frequency decay:
+    // Higher indices in FWHT represent higher sequencies (frequencies).
+    // We decay higher sequencies by a factor of their index ^ (-alpha).
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        if (i > 0) {
+            float freq_decay = pow(float(i), -alpha);
+            shared_real[i] *= freq_decay;
+        }
+    }
+    barrier();
+    
+    // 3. Write out
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        data_out[base_idx + i] = shared_real[i];
+    }
+}

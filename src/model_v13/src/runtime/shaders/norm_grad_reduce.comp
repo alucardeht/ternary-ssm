@@ -1,0 +1,67 @@
+#version 450
+
+/* RMSNorm — Gradient reduction over all positions
+ *
+ * One workgroup per output dimension j in [0, d_model).
+ * Total dispatch: d_model workgroups.
+ *
+ * For each position pos in [0, total_positions):
+ *   h_normed = HFinal[pos * d + j] / RMS[pos]
+ *   sum_w   += h_normed * DH[pos * d + j]   → d(loss)/d(norm_w[j])
+ *   sum_b   += DH[pos * d + j]              → d(loss)/d(norm_b[j])
+ *
+ * 256 threads each accumulate a partial sum over their assigned positions,
+ * then a shared-memory reduction tree collapses to a scalar written by
+ * thread 0 into DNormW[j] and DNormB[j].
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufHFinal  { float h_final[]; };
+layout(set = 0, binding = 1) readonly  buffer BufDH      { float dh[];      };
+layout(set = 0, binding = 2) readonly  buffer BufRMS     { float rms[];     };
+layout(set = 0, binding = 3) writeonly buffer BufDNormW  { float d_norm_w[]; };
+layout(set = 0, binding = 4) writeonly buffer BufDNormB  { float d_norm_b[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_model;
+    uint total_positions;
+} pc;
+
+shared float s_sum_w[256];
+shared float s_sum_b[256];
+
+void main() {
+    uint j   = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (j >= pc.d_model) return;
+
+    float acc_w = 0.0;
+    float acc_b = 0.0;
+
+    for (uint pos = tid; pos < pc.total_positions; pos += 256u) {
+        uint  idx      = pos * pc.d_model + j;
+        float h_normed = h_final[idx] / rms[pos];
+        float grad_h   = dh[idx];
+        acc_w += h_normed * grad_h;
+        acc_b += grad_h;
+    }
+
+    s_sum_w[tid] = acc_w;
+    s_sum_b[tid] = acc_b;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_sum_w[tid] += s_sum_w[tid + s];
+            s_sum_b[tid] += s_sum_b[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        d_norm_w[j] = s_sum_w[0];
+        d_norm_b[j] = s_sum_b[0];
+    }
+}

@@ -1,0 +1,35 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufHPrev { float h_prev[]; };
+layout(set = 0, binding = 1) buffer BufX { float x_t[]; };
+layout(set = 0, binding = 2) buffer BufA { float A_eff[]; };
+layout(set = 0, binding = 3) buffer BufB { float B_eff[]; };
+layout(set = 0, binding = 4) buffer BufHNext { float h_next[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint d_state;
+    float homotopy_s; // evaluated at s (usually 1.0, but allows continuous interpolation)
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+    
+    // Continuous Homotopy State Transition
+    // H(h, s) = (1-s)h_prev + s(A * h_prev + B * x_t)
+    // When s=1, it's the standard discrete step. When s is learned or perturbed, it explores the manifold.
+    
+    uint offset = batch_idx * pc.d_state + idx;
+    
+    float h = h_prev[offset];
+    float x = x_t[offset];
+    float a = A_eff[offset];
+    float b = B_eff[offset];
+    
+    float target_state = a * h + b * x;
+    float homotopy_state = (1.0 - pc.homotopy_s) * h + pc.homotopy_s * target_state;
+    
+    h_next[offset] = homotopy_state;
+}

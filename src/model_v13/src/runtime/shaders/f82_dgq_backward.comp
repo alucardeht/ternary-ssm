@@ -1,0 +1,49 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufCurvature { float curvature[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float max_levels;
+    float min_levels;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Dynamic Gradient Quantization
+    // Quantize gradients based on local curvature.
+    // Flat regions (low curvature) -> higher precision (more levels).
+    // Steep regions (high curvature) -> lower precision (fewer levels).
+    
+    float g_val = g_in[idx];
+    float curv = curvature[idx]; // Proxy: pre-calculated local curvature
+    
+    // Normalize curvature to [0, 1] for interpolation.
+    // Assume curv is somewhat bounded or we clamp it.
+    float curv_clamped = clamp(curv, 0.0, 1.0);
+    
+    // Interpolate levels based on curvature.
+    // Higher curvature -> closer to min_levels.
+    // Lower curvature -> closer to max_levels.
+    float levels = mix(pc.max_levels, pc.min_levels, curv_clamped);
+    levels = max(1.0, floor(levels)); // Ensure at least 1 level
+    
+    // Simple quantization
+    float sign_g = sign(g_val);
+    float abs_g = abs(g_val);
+    
+    // We quantize the absolute value.
+    // Assume max gradient magnitude is roughly 1.0 for this proxy, or we normalize it.
+    // For simplicity, we just round to the nearest level step.
+    float q_step = 1.0 / levels;
+    float q_val = floor(abs_g / q_step + 0.5) * q_step;
+    
+    float out_g = sign_g * q_val;
+    
+    g_out[idx] = out_g;
+}

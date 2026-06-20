@@ -1,0 +1,45 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufParam { float param[]; };
+layout(set = 0, binding = 2) buffer BufMomentum { float momentum[]; };
+layout(set = 0, binding = 3) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float dt;
+    float damping;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Symplectic Gradient Integration (e.g., Leapfrog step for Hamiltonian system)
+    // p_{t+1/2} = p_t - dt/2 * grad(q_t)
+    // q_{t+1} = q_t + dt * p_{t+1/2}
+    // p_{t+1} = p_{t+1/2} - dt/2 * grad(q_{t+1})
+    // For a single backward pass, we compute the momentum update and return
+    // the effective gradient to apply to the parameters.
+    
+    float g_val = g_in[idx];
+    float m_val = momentum[idx];
+    float p_val = param[idx];
+    
+    // Update momentum (half-step or full-step depending on optimizer wrapping)
+    // Assuming simple Hamiltonian H = K(p) + V(q) where K(p) = p^2/2m
+    // dp/dt = -dV/dq = -grad
+    
+    // Leapfrog momentum half-step (proxy)
+    float m_next = m_val - 0.5 * pc.dt * g_val;
+    
+    // Apply damping
+    m_next *= (1.0 - pc.damping);
+    
+    // The effective parameter update is driven by momentum
+    float effective_g = -m_next; // Since param update is usually q - lr * effective_g
+    
+    momentum[idx] = m_next;
+    g_out[idx] = effective_g;
+}

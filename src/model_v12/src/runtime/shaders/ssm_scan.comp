@@ -1,0 +1,69 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+/* SSM Parallel Prefix Scan replaced with Symplectic Integrator State-Space Flow (SIS-SF)
+ * sequential time loop to match CPU training exactly.
+ *
+ * Dispatch: one workgroup of size 256 per state channel (dim) and batch (b).
+ * Thread 0 computes the sequential StÃ¶rmer-Verlet update for dim < half_d.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; };   /* [seq_len Ã— d_state] */
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; };   /* [seq_len Ã— d_state] */
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x[];     };   /* [seq_len Ã— d_state] */
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  };   /* [d_state] */
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; };   /* [seq_len Ã— d_state] */
+
+layout(push_constant) uniform PC {
+    uint seq_len;       /* 512 */
+    uint d_state;       /* 128 */
+    uint has_bilinear;  /* 1 if C_bilinear active, 0 otherwise */
+} pc;
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;  /* batch index */
+    uint tid = gl_LocalInvocationID.x;
+
+    uint half_d = pc.d_state / 2;
+    if (dim >= half_d) return;
+
+    if (tid == 0u) {
+        uint T = pc.seq_len;
+        uint batch_base = b * T * pc.d_state;
+        
+        float q_prev = 0.0;
+        float p_prev = 0.0;
+
+        for (uint t = 0; t < T; t++) {
+            uint idx_q = batch_base + t * pc.d_state + dim;
+            uint idx_p = batch_base + t * pc.d_state + dim + half_d;
+            
+            float w_q = A_eff[idx_q];
+            float w_x = B_eff[idx_q];
+            float m_inv = A_eff[idx_p];
+            float x_val = x[idx_q];
+            
+            float dt_val = 1.0;
+            
+            float v_prev = w_q * q_prev + w_x * x_val;
+            float tanh_v_prev = tanh(v_prev);
+            float grad_q_prev = -w_q * (1.0 - tanh_v_prev * tanh_v_prev);
+            float p_half = p_prev - (dt_val * 0.5) * grad_q_prev;
+            
+            float q_new = q_prev + dt_val * m_inv * p_half;
+            
+            float v_new = w_q * q_new + w_x * x_val;
+            float tanh_v_new = tanh(v_new);
+            float grad_q_new = -w_q * (1.0 - tanh_v_new * tanh_v_new);
+            float p_new = p_half - (dt_val * 0.5) * grad_q_new;
+            
+            h_out[idx_q] = q_new;
+            h_out[idx_p] = p_new;
+            
+            q_prev = q_new;
+            p_prev = p_new;
+        }
+    }
+}

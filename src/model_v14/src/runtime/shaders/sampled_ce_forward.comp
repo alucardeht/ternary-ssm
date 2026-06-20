@@ -1,0 +1,412 @@
+#version 450
+
+/* Sampled Cross-Entropy Loss — Forward + Backward
+ *
+ * One workgroup per valid position (b, t) where t in [0, T-1).
+ * Total dispatch: B * (T-1) workgroups.
+ *
+ * For each position:
+ *   1. Thread 0 samples k_noise noise tokens via LCG + binary search on CDF,
+ *      rejecting duplicates with the target token. Candidate set has n_samples
+ *      entries: [target] + [k_noise noise tokens].
+ *   2. All 256 threads collaborate to compute each ternary dot product
+ *      (CSR gather-sum) for each candidate vocabulary token.
+ *   3. Thread 0 applies importance-weighting correction, log-sum-exp,
+ *      computes scalar CE loss, and writes d_logits for each candidate.
+ *
+ * Shared memory layout (256 floats each):
+ *   s_sample_ids[256]   — sampled vocab indices (padded with 0 beyond n_samples)
+ *   s_log_proposal[256] — log Q(v) for each candidate
+ *   s_logits[256]       — logit for each candidate after dot product
+ *   s_reduce[256]       — scratch for parallel reduction
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if TOLR_ENABLED
+layout(set = 0, binding = 0) readonly  buffer BufEmbedE     { float embed_E[];    };
+layout(set = 0, binding = 1) readonly  buffer BufEmbedP     { float embed_P[];    };
+layout(set = 0, binding = 2) readonly  buffer BufDummy1     { int   dummy1[];     };
+layout(set = 0, binding = 3) readonly  buffer BufDummy2     { int   dummy2[];     };
+#else
+layout(set = 0, binding = 0)  readonly  buffer BufRowPtrPos  { int  rpp[];       };
+layout(set = 0, binding = 1)  readonly  buffer BufPosIndices { int  pi[];        };
+layout(set = 0, binding = 2)  readonly  buffer BufRowPtrNeg  { int  rpn[];       };
+layout(set = 0, binding = 3)  readonly  buffer BufNegIndices { int  ni[];        };
+#endif
+layout(set = 0, binding = 4)  readonly  buffer BufNormOut    { float norm_out[]; };
+layout(set = 0, binding = 5)  readonly  buffer BufTokens     { uint  tokens[];   };
+layout(set = 0, binding = 6)  readonly  buffer BufUnigramCDF { float cdf[];      };
+layout(set = 0, binding = 7)  readonly  buffer BufLogUnigram { float log_q[];    };
+layout(set = 0, binding = 8)  writeonly buffer BufSampleIDs  { uint  sample_ids[]; };
+layout(set = 0, binding = 9)  buffer    BufDLogits           { float d_logits[];   };
+layout(set = 0, binding = 10) buffer    BufLossOut           { float loss_out[];   };
+layout(set = 0, binding = 11) readonly  buffer BufPriorCtxCounts  { uint  prior_ctx_counts[];  };
+layout(set = 0, binding = 12) readonly  buffer BufPriorPairKeys   { uint  prior_pair_keys[];   };
+layout(set = 0, binding = 13) readonly  buffer BufPriorPairCounts { uint  prior_pair_counts[]; };
+layout(set = 0, binding = 14) readonly  buffer BufPriorUnigram    { float prior_unigram[];     };
+layout(set = 0, binding = 15) buffer    BufBaseLossOut            { float base_loss_out[];     };
+layout(set = 0, binding = 16) readonly  buffer BufProgramTargets   { uint  program_targets[];   };
+layout(set = 0, binding = 17) readonly  buffer BufProgramCounts    { uint  program_counts[];    };
+layout(set = 0, binding = 18) readonly  buffer BufAtlasKeys        { uint  atlas_keys[];        };
+layout(set = 0, binding = 19) readonly  buffer BufAtlasTargets     { uint  atlas_targets[];     };
+layout(set = 0, binding = 20) readonly  buffer BufAtlasCounts      { uint  atlas_counts[];      };
+layout(set = 0, binding = 21) buffer    BufEmaLogits       { float ema_logits[];      };
+layout(set = 0, binding = 22) readonly  buffer BufTokenFreq       { float token_freq[];      }; /* Q-06 */
+
+layout(push_constant) uniform PC {
+    uint seq_len;    /* T */
+    uint d_model;    /* H */
+    uint vocab_size; /* V */
+    uint n_samples;  /* 251 = target + k_noise */
+    uint k_noise;    /* 250 */
+    uint batch_size; /* B */
+    uint rng_seed;
+    uint corpus_prior_enabled;
+    uint corpus_prior_pair_capacity;
+    float corpus_prior_alpha;
+    float corpus_prior_scale;
+    uint logit_prior_gate_enabled;
+    uint program_kernel_enabled;
+    float program_kernel_logit_boost;
+    uint program_kernel_gate_enabled;
+    uint state_atlas_enabled;
+    uint state_atlas_capacity;
+    float state_atlas_logit_boost;
+    uint state_atlas_gate_enabled;
+    float martingale_lambda;
+} pc;
+
+shared uint  s_sample_ids[256];
+shared float s_log_proposal[256];
+shared float s_logits[256];
+shared float s_reduce[256];
+
+/* LCG step: multiplier and increment from Numerical Recipes */
+uint lcg_next(uint state) {
+    return state * 1664525u + 1013904223u;
+}
+
+/* Binary search on unigram CDF in [0, vocab_size).
+ * Returns smallest index i such that cdf[i] >= u. */
+uint cdf_sample(float u) {
+    uint lo = 0u;
+    uint hi = pc.vocab_size - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (cdf[mid] < u) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/* Check whether candidate v is already present in s_sample_ids[0..count-1]. */
+bool already_sampled(uint v, uint count) {
+    for (uint i = 0u; i < count; i++) {
+        if (s_sample_ids[i] == v) return true;
+    }
+    return false;
+}
+
+uint corpus_prior_key(uint context, uint target) {
+    return (context << 16u) | target;
+}
+
+uint corpus_prior_mix32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float corpus_logit_prior(uint context, uint target) {
+    if (pc.corpus_prior_enabled == 0u || pc.corpus_prior_pair_capacity == 0u) return 0.0;
+    if (context >= pc.vocab_size || target >= pc.vocab_size) return 0.0;
+
+    float p_uni = max(prior_unigram[target], 1.0e-30);
+    uint ctx_count = prior_ctx_counts[context];
+    if (ctx_count == 0u) return 0.0;
+
+    uint pair_count = 0u;
+    uint key = corpus_prior_key(context, target);
+    uint mask = pc.corpus_prior_pair_capacity - 1u;
+    uint slot = corpus_prior_mix32(key) & mask;
+    for (uint probe = 0u; probe < pc.corpus_prior_pair_capacity; probe++) {
+        uint count = prior_pair_counts[slot];
+        if (count == 0u) break;
+        if (prior_pair_keys[slot] == key) {
+            pair_count = count;
+            break;
+        }
+        slot = (slot + 1u) & mask;
+    }
+
+    float alpha = max(pc.corpus_prior_alpha, 1.0e-9);
+    float numerator = float(pair_count) + alpha * p_uni;
+    float denominator = float(ctx_count) + alpha;
+    float p_prior = max(numerator / denominator, 1.0e-30);
+    return pc.corpus_prior_scale * log(p_prior / p_uni);
+}
+
+float program_kernel_logit(uint context, uint target) {
+    if (pc.program_kernel_enabled == 0u) return 0.0;
+    if (context >= pc.vocab_size || target >= pc.vocab_size) return 0.0;
+    uint predicted = program_targets[context];
+    uint support = program_counts[context];
+    if (support == 0u) return 0.0;
+    if (predicted == 0xffffffffu || predicted != target) return 0.0;
+    return pc.program_kernel_logit_boost;
+}
+
+uint state_atlas_key(uint prev, uint context) {
+    return (prev << 16u) | context;
+}
+
+float state_transition_atlas_logit(uint prev, uint context, uint target) {
+    if (pc.state_atlas_enabled == 0u || pc.state_atlas_capacity == 0u) return 0.0;
+    if (prev >= pc.vocab_size || context >= pc.vocab_size || target >= pc.vocab_size) return 0.0;
+
+    uint key = state_atlas_key(prev, context);
+    uint mask = pc.state_atlas_capacity - 1u;
+    uint slot = corpus_prior_mix32(key) & mask;
+    for (uint probe = 0u; probe < pc.state_atlas_capacity; probe++) {
+        uint count = atlas_counts[slot];
+        if (count == 0u) break;
+        if (atlas_keys[slot] == key) {
+            uint predicted = atlas_targets[slot];
+            if (predicted == 0xffffffffu || predicted != target) return 0.0;
+            return pc.state_atlas_logit_boost;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return 0.0;
+}
+
+void main() {
+    uint pos = gl_WorkGroupID.x;   /* flat position index in [0, B*(T-1)) */
+    uint tid = gl_LocalInvocationID.x;
+
+    uint total_positions = pc.batch_size * (pc.seq_len - 1u);
+    if (pos >= total_positions) return;
+
+    uint b = pos / (pc.seq_len - 1u);
+    uint t = pos % (pc.seq_len - 1u);
+
+    /* Target token is the next token after position t */
+    uint context = tokens[b * pc.seq_len + t];
+    uint target = tokens[b * pc.seq_len + t + 1u];
+
+    /* Base offset into NormOut for this (b, t) position */
+    uint h_base = (b * pc.seq_len + t) * pc.d_model;
+
+    /* ------------------------------------------------------------------ */
+    /* Phase 1 (thread 0 only): populate s_sample_ids and s_log_proposal  */
+    /* ------------------------------------------------------------------ */
+    if (tid == 0u) {
+        /* Slot 0: target token, proposal weight = 1 (treated as 1/k_noise
+         * in importance correction; stored as log(1) = 0 placeholder here
+         * and corrected below via the NCE formula) */
+        s_sample_ids[0]    = target;
+        s_log_proposal[0]  = log_q[target];
+
+        /* Slots 1..k_noise: noise samples from unigram */
+        uint rng = pc.rng_seed ^ (pos * 2654435761u);
+        uint filled = 1u;
+        uint max_attempts = pc.k_noise * 8u; /* guard against infinite loop */
+        for (uint attempt = 0u; attempt < max_attempts && filled < pc.n_samples; attempt++) {
+            rng = lcg_next(rng);
+            /* Map uint to [0, 1) float */
+            float u = float(rng) / 4294967296.0;
+            uint v  = cdf_sample(u);
+            if (v == target) continue;
+            if (already_sampled(v, filled)) continue;
+            s_sample_ids[filled]   = v;
+            s_log_proposal[filled] = log_q[v];
+            filled++;
+        }
+        /* Fill remaining slots with target (logit contribution cancels in softmax) */
+        for (uint i = filled; i < pc.n_samples; i++) {
+            s_sample_ids[i]   = target;
+            s_log_proposal[i] = log_q[target];
+        }
+    }
+
+    /* Zero out unused shared slots so reduction is clean */
+    if (tid >= pc.n_samples) {
+        s_logits[tid] = 0.0;
+    }
+
+    barrier();
+
+    /* ------------------------------------------------------------------ */
+    /* Phase 2: compute ternary dot products for each candidate            */
+    /* All 256 threads collaborate on one candidate at a time.             */
+    /* ------------------------------------------------------------------ */
+#if TOLR_ENABLED
+    if (tid < 128u) {
+        float sum = 0.0;
+        uint e = tid;
+        for (uint j = 0u; j < pc.d_model; j++) {
+            sum += embed_P[e * pc.d_model + j] * norm_out[h_base + j];
+        }
+        s_reduce[e] = sum;
+    }
+    barrier();
+
+    if (tid < pc.n_samples) {
+        uint v = s_sample_ids[tid];
+        float sum = 0.0;
+        for (uint e = 0u; e < 128u; e++) {
+            sum += embed_E[v * 128u + e] * s_reduce[e];
+        }
+        s_logits[tid] = sum;
+    }
+    barrier();
+#else
+    for (uint c = 0u; c < pc.n_samples; c++) {
+        uint v = s_sample_ids[c];
+
+        /* Positive CSR gather */
+        int p_start = rpp[v];
+        int p_end   = rpp[v + 1];
+        float acc_pos = 0.0;
+        for (int k = p_start + int(tid); k < p_end; k += 256) {
+            acc_pos += norm_out[h_base + uint(pi[k])];
+        }
+
+        /* Negative CSR gather */
+        int n_start = rpn[v];
+        int n_end   = rpn[v + 1];
+        float acc_neg = 0.0;
+        for (int k = n_start + int(tid); k < n_end; k += 256) {
+            acc_neg += norm_out[h_base + uint(ni[k])];
+        }
+
+        s_reduce[tid] = acc_pos - acc_neg;
+        barrier();
+
+        /* Parallel reduction (power-of-2 tree) */
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                s_reduce[tid] += s_reduce[tid + s];
+            }
+            barrier();
+        }
+
+        if (tid == 0u) {
+            s_logits[c] = s_reduce[0];
+        }
+        barrier();
+    }
+#endif
+
+    /* ------------------------------------------------------------------ */
+    /* Phase 3 (thread 0): importance correction, log-sum-exp, loss,      */
+    /* and d_logits computation.                                           */
+    /* ------------------------------------------------------------------ */
+    if (tid == 0u) {
+        /* Importance-corrected logits: subtract log proposal weight.
+         * Under NCE / sampled softmax, the corrected score for candidate v is:
+         *   corrected[c] = logit[c] - log(k_noise * Q(v))
+         * For the target we use log(1) = 0 for the k_noise factor
+         * (it is the true positive, not a noise sample).
+         * For noise tokens: subtract log(k_noise * Q(v)).
+         */
+        float k_log = log(float(pc.k_noise));
+
+        float corrected[256]; /* GLSL limits — n_samples <= 256 */
+        for (uint c = 0u; c < pc.n_samples; c++) {
+            float prior = 0.0;
+            if (pc.corpus_prior_enabled != 0u) {
+                prior = corpus_logit_prior(context, s_sample_ids[c]);
+            }
+            prior += program_kernel_logit(context, s_sample_ids[c]);
+            if (t > 0u) {
+                uint prev = tokens[b * pc.seq_len + t - 1u];
+                prior += state_transition_atlas_logit(prev, context, s_sample_ids[c]);
+            }
+            if (c == 0u) {
+                corrected[c] = s_logits[c] + prior;
+            } else {
+                corrected[c] = s_logits[c] + prior - k_log - s_log_proposal[c];
+            }
+        }
+
+        /* Numerically stable log-sum-exp over all candidates */
+        float max_val = corrected[0];
+        for (uint c = 1u; c < pc.n_samples; c++) {
+            if (corrected[c] > max_val) max_val = corrected[c];
+        }
+
+        float sum_exp = 0.0;
+        for (uint c = 0u; c < pc.n_samples; c++) {
+            sum_exp += exp(corrected[c] - max_val);
+        }
+        float log_sum_exp = max_val + log(sum_exp);
+
+        /* CE loss = log_sum_exp - corrected[target_slot=0] */
+        float loss = log_sum_exp - corrected[0];
+        loss_out[pos] = loss;
+
+        if (pc.logit_prior_gate_enabled != 0u ||
+            pc.program_kernel_gate_enabled != 0u ||
+            pc.state_atlas_gate_enabled != 0u) {
+            float base_target = s_logits[0];
+            float base_max = base_target;
+            for (uint c = 1u; c < pc.n_samples; c++) {
+                float base_score = s_logits[c] - k_log - s_log_proposal[c];
+                if (base_score > base_max) base_max = base_score;
+            }
+
+            float base_sum_exp = exp(base_target - base_max);
+            for (uint c = 1u; c < pc.n_samples; c++) {
+                float base_score = s_logits[c] - k_log - s_log_proposal[c];
+                base_sum_exp += exp(base_score - base_max);
+            }
+            base_loss_out[pos] = (base_max + log(base_sum_exp)) - base_target;
+        } else {
+            base_loss_out[pos] = 0.0;
+        }
+
+        /* Softmax probabilities and d_logits = softmax - one_hot */
+        float inv_n   = 1.0 / float(pc.seq_len - 1u);
+        float inv_sum = inv_n / sum_exp;
+        
+        // S-19: Event-Triggered Backpropagation Thresholding
+        // Only perform backpropagation on tokens where CE surprise > 0.10
+        bool skip_bwd = (loss < 0.10);
+
+        for (uint c = 0u; c < pc.n_samples; c++) {
+            float softmax_c = exp(corrected[c] - max_val) * inv_sum;
+            float one_hot   = (c == 0u) ? inv_n : 0.0;
+            float grad      = skip_bwd ? 0.0 : (softmax_c - one_hot);
+
+            uint d_idx = pos * pc.n_samples + c;
+            
+            // Q-03: Martingale Difference Penalty on Forward Logits
+            if (pc.martingale_lambda > 0.0) {
+                float current_logit = s_logits[c];
+                float ema = ema_logits[d_idx];
+                ema_logits[d_idx] = 0.9 * ema + 0.1 * current_logit;
+                // Add the squared difference gradient to the CE cotangent
+                // R = lambda * (y_t - E)^2  => dR/dy_t = 2 * lambda * (y_t - E)
+                grad += 2.0 * pc.martingale_lambda * (current_logit - ema);
+            }
+            
+            /* Q-06: Credit-Time Equalized Dynamics on Token Frequency */
+            float f_z = token_freq[s_sample_ids[c]];
+            float q06_scale = 1.0 / log(1.0 + f_z + 1e-6);
+            d_logits[d_idx] = grad * q06_scale;
+        }
+
+        /* Write sample IDs for this position to output buffer */
+        uint id_base = pos * pc.n_samples;
+        for (uint c = 0u; c < pc.n_samples; c++) {
+            sample_ids[id_base + c] = s_sample_ids[c];
+        }
+    }
+}

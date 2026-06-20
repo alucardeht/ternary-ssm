@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufBlockMomentum { float block_momentum[]; };
+layout(set = 0, binding = 3) buffer BufBlockIndices { uint block_indices[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float block_weight;
+    float local_weight;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Hierarchical Momentum Routing
+    // Blend individual gradient/momentum with structural block momentum.
+    // Proxy: we use block_momentum based on a mapping (block_indices).
+    
+    float g_val = g_in[idx];
+    uint b_idx = block_indices[idx];
+    float b_mom = block_momentum[b_idx];
+    
+    // The routed update is a blend of local gradient and block momentum
+    // (In a full optimizer, we'd blend the parameter's local momentum, but here we blend into the gradient directly as a proxy update)
+    float routed_g = (pc.local_weight * g_val + pc.block_weight * b_mom) / 
+                     (pc.local_weight + pc.block_weight + 1e-6);
+                     
+    g_out[idx] = routed_g;
+}

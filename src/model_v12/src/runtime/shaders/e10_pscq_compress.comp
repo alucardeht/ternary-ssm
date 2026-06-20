@@ -1,0 +1,36 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuf {
+    float in_data[];
+};
+layout(set = 0, binding = 1) writeonly buffer OutBuf {
+    uint out_data[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint total_elements;
+} pc;
+
+#define SQRT2_INV 0.7071067811865475
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id * 4 >= pc.total_elements) return;
+
+    float q1 = in_data[id * 4 + 0];
+    float p1 = in_data[id * 4 + 1];
+    float q2 = in_data[id * 4 + 2];
+    float p2 = in_data[id * 4 + 3];
+
+    // Structure-preserving symplectic mapping
+    float sq1 = (q1 + p1) * SQRT2_INV;
+    float sp1 = (q1 - p1) * SQRT2_INV;
+    float sq2 = (q2 + p2) * SQRT2_INV;
+    float sp2 = (q2 - p2) * SQRT2_INV;
+
+    vec4 v = vec4(sq1, sp1, sq2, sp2);
+
+    // Map into discrete polytope index via 4x8 packing
+    out_data[id] = packSnorm4x8(v);
+}

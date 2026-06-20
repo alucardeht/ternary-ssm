@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufCotangentIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufState { float h_state[]; };
+layout(set = 0, binding = 2) buffer BufCotangentOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    float penalty_weight;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+    
+    // Diffeomorphic State-Space Trajectory Shaping
+    // Penalize the trajectory if it self-intersects or moves against the manifold flow.
+    // We approximate this by penalizing rapid oscillations in the state trajectory:
+    // grad += penalty_weight * (2 * h_t - h_{t-1} - h_{t+1}) (Laplacian penalty)
+    
+    for (uint t = 0; t < pc.seq_len; t++) {
+        uint offset = batch_idx * pc.d_state * pc.seq_len;
+        uint t_idx = offset + t * pc.d_state + idx;
+        
+        float g_val = g_in[t_idx];
+        
+        float h_t = h_state[t_idx];
+        float h_tm1 = (t > 0) ? h_state[offset + (t - 1) * pc.d_state + idx] : 0.0;
+        float h_tp1 = (t < pc.seq_len - 1) ? h_state[offset + (t + 1) * pc.d_state + idx] : 0.0;
+        
+        // Laplacian penalty on the path (smoothness / non-intersection proxy)
+        float diffeo_penalty = 0.0;
+        if (t > 0 && t < pc.seq_len - 1) {
+            diffeo_penalty = pc.penalty_weight * (2.0 * h_t - h_tm1 - h_tp1);
+        }
+        
+        g_out[t_idx] = g_val + diffeo_penalty;
+    }
+}

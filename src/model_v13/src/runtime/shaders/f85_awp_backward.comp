@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufWeights { float weights[]; };
+layout(set = 0, binding = 1) buffer BufGrad { float grad[]; };
+layout(set = 0, binding = 2) buffer BufPerturbedWeights { float perturbed_weights[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float perturbation_scale;
+    float epsilon;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Adversarial Weight Perturbation (AWP)
+    // Perturb weights in the direction of the gradient before forward pass.
+    // W_perturbed = W + scale * grad / (||grad|| + eps)
+    // We proxy the ||grad|| with local abs(grad) or a constant norm.
+    
+    float w_val = weights[idx];
+    float g_val = grad[idx];
+    
+    // A simplified element-wise proxy for the perturbation step
+    // direction = sign(g_val) or normalized g_val
+    float direction = g_val / (abs(g_val) + pc.epsilon);
+    
+    float perturbed = w_val + pc.perturbation_scale * direction;
+    
+    perturbed_weights[idx] = perturbed;
+}

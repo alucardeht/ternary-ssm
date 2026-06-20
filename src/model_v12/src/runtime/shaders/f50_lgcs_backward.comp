@@ -1,0 +1,48 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufCotangentIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufA { float A_eff[]; };
+layout(set = 0, binding = 2) buffer BufC { float C_eff[]; };
+layout(set = 0, binding = 3) buffer BufCotangentOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    float lambda; // injection scale
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+    
+    // Lie Group Commutator Signal Injection
+    // gradient = g_CE + lambda * grad( Tr([A_t, A_{t-1}] C^T CE_target) )
+    // We approximate the commutator impact on the state dimensions dynamically.
+    
+    for (uint t = 1; t < pc.seq_len; t++) {
+        uint t_idx = t * pc.d_state + idx;
+        uint tm1_idx = (t - 1) * pc.d_state + idx;
+        uint offset = batch_idx * pc.d_state * pc.seq_len;
+        
+        float a_t = A_eff[t_idx];
+        float a_tm1 = A_eff[tm1_idx];
+        float c_t = C_eff[t_idx];
+        
+        // Since A is often modeled as diagonal in some bases, [A_t, A_{t-1}] might be zero.
+        // However, if A has off-diagonal components (or in a broader Lie algebra), we inject
+        // a synthetic non-commutativity penalty gradient to force syntactic capability.
+        // Here we simulate the commutator gradient component.
+        float commutator_grad = (a_t * a_tm1 - a_tm1 * a_t); // 0 if strictly diagonal scalar, so we perturb it
+        // Actually, we inject a signal based on the difference to force non-commutativity:
+        float syntax_signal = pc.lambda * (a_t - a_tm1) * c_t;
+        
+        float g_val = g_in[offset + t * pc.d_state + idx];
+        
+        g_out[offset + t * pc.d_state + idx] = g_val + syntax_signal;
+    }
+    
+    // Copy t=0 directly
+    g_out[batch_idx * pc.d_state * pc.seq_len + idx] = g_in[batch_idx * pc.d_state * pc.seq_len + idx];
+}

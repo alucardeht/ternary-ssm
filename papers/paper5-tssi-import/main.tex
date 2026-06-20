@@ -1,0 +1,521 @@
+\documentclass{article}
+\usepackage[preprint]{neurips_2025}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts, amsmath, amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{natbib}
+
+\title{Ternary Sufficient-Statistic Import for State-Space Language Model Training}
+
+\author{
+  Julio Jose Lena \\
+  Independent Researcher \\
+  \texttt{juliolena25@gmail.com} \\
+  \url{https://orcid.org/0009-0001-0817-6591}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This paper introduces Ternary Sufficient-Statistic Import (TSSI), a training
+object for state-space language models with ternary weights. The motivating
+question is deliberately narrow: before iterative optimization begins, can a
+corpus be compiled into model-native $\{-1,0,+1\}$ commitments that already
+answer part of the cross-entropy descent problem? TSSI does not import text,
+examples, retrieval memory, or a teacher model. It streams the corpus once,
+accumulates original cross-entropy directional moments in a fixed SSM feature
+map, realizes stable directions as sparse ternary sign/zero commitments, and
+then leaves the remaining error to ordinary residual training on the same
+next-token objective. Initial gates on byte-level v12 shards show that
+corpus-derived ternary commitments beat density-matched random and
+sign-shuffled controls, including over live Vulkan SSM hidden states and
+record-disjoint held-out trace rotations. The result supports TSSI as a
+training-theoretic mechanism: useful corpus information can be converted into a
+ternary SSM artifact without becoming raw memorization or a replacement
+objective.
+\end{abstract}
+
+\section{Introduction}
+
+The usual framing of language-model training treats the corpus as something
+that must be visited many times by an optimizer until useful structure has been
+written into the parameters. For continuous weights this is natural: the model
+must discover both a direction and a magnitude in a high-dimensional real
+space. For a ternary state-space model, however, the first useful question is
+smaller and more discrete. A coordinate often only needs an initial answer to
+one of three possibilities: negative, zero, or positive. If the corpus already
+contains enough directional evidence for some of those answers, then forcing
+all of that evidence to pass through ordinary training steps is not a law of
+learning; it is a design choice.
+
+The phrase ``dataset import'' is easy to misread. A literal import of a
+dataset into a model is not the object studied here. Storing examples, building
+a lookup table, or hiding retrieval behind the parameter interface would evade
+the training problem rather than improve it. The admissible object is narrower:
+a sufficient statistic for a particular training objective. In this paper the
+objective remains next-token cross-entropy, and the imported artifact is only a
+set of sparse ternary commitments in model coordinates. Anything not supported
+by stable corpus evidence is left as zero, so the ordinary residual training
+process still owns the unsolved part of the model.
+
+This gives a different way to ask what a corpus can do before training. Instead
+of asking whether text can be compressed into weights, TSSI asks whether
+cross-entropy moments can be compiled into the same ternary decision surface
+that training would otherwise have to reach by repeated updates. The compiler
+streams contexts and targets, accumulates directional moments under the
+original loss, applies an abstention threshold, and writes only
+$\{-1,0,+1\}$ decisions. The zero state is important: it is not failure, but an
+explicit refusal to pretend that weak evidence is already knowledge.
+
+The empirical claim is correspondingly scoped. On byte-level v12 shards, a
+bigram feature gate, residual cross-entropy pilots, a deterministic recurrent
+\texttt{ssm\_state} proxy, live Vulkan SSM hidden-state traces, and
+record-disjoint held-out rotations all show the same qualitative behavior:
+corpus-derived ternary commitments carry real predictive signal beyond
+density-matched random or sign-shuffled controls. The live SSM result matters
+most because it places the statistic in actual state-space coordinates rather
+than in a purely symbolic proxy. The record-disjoint rotations matter because
+they reduce the simplest memorization explanation: the held-out records change,
+yet the all-layer imported commitments remain better than matched random
+commitments.
+
+The contribution is therefore not a new dataset, not a teacher-distillation
+method, and not an associative memory. It is a training-theoretic object for
+ternary SSMs: a corpus-to-commitment map that preserves the original
+cross-entropy objective and initializes part of the ternary search problem
+before residual optimization. The rest of the paper defines this object,
+separates it from nearby prior art, states the validation protocol, and reports
+the current gates.
+
+\section{Background and Related Work}
+
+\paragraph{Dataset distillation and condensation.}
+Dataset distillation asks for a small synthetic training set that can replace a
+larger corpus for downstream optimization \citep{wang2018datasetdistillation}.
+Text-level variants such as DiLM move this idea into language by generating
+synthetic text that trains a model efficiently \citep{dilm2024}. TSSI is not a
+synthetic dataset. It has no generated examples and no second corpus that the
+optimizer later consumes. The output is a model-coordinate artifact: a sparse
+ternary commitment pattern derived from the original cross-entropy moments.
+The distinction matters because a distilled dataset still delegates learning to
+future optimization over examples, while TSSI answers a bounded subset of the
+ternary parameter decisions directly.
+
+\paragraph{Data-dependent initialization.}
+Another nearby line uses data to choose a better initialization for continuous
+training. Classical data-dependent initializations match early activation or
+gradient scales \citep{krahenbuhl2015data}; GradInit tunes initialization to
+improve early optimization dynamics \citep{zhang2021gradinit}; AutoInit searches
+for initialization rules that stabilize neural networks automatically
+\citep{bingham2021autoinit}. These methods remain continuous in spirit. Their
+goal is to place the optimizer in a numerically favorable region. TSSI instead
+uses data to make discrete ternary commitments. The imported state is not a
+scale, variance, or conditioning adjustment; it is a partial answer to the
+model's sign/zero decision problem under the original loss.
+
+\paragraph{Ternary and low-bit language models.}
+Low-bit language-model work shows that large networks can preserve useful
+behavior under severe quantization \citep{wang2023bitnet, ma2024era}. Earlier
+ternary-weight methods also study how to train or quantize networks with
+$\{-1,0,+1\}$ weights \citep{li2016ternary}. Those results make the present
+question plausible, but they do not define a corpus-to-ternary import object.
+The usual quantization problem starts with trained or trainable real-valued
+parameters and asks how to represent them cheaply. TSSI starts one step earlier:
+given a corpus and a fixed SSM feature map, which ternary coordinates already
+have enough evidence to be committed before residual training continues?
+
+\paragraph{State-space coordinates.}
+The coordinate system is also part of the claim. Modern SSMs such as Mamba
+derive much of their sequence behavior from recurrent hidden states rather than
+only from local token features \citep{gu2024mamba}. A corpus statistic that
+passes in a bag-of-symbols proxy may still fail when placed into live recurrent
+state coordinates. For that reason, the strongest current TSSI evidence is not
+the byte/bigram gate by itself, but the live Vulkan SSM hidden-state trace and
+the record-disjoint rotations over that trace. The artifact is intended to be
+model-native, not merely corpus-native.
+
+\paragraph{Memory and teacher boundaries.}
+TSSI should also be separated from retrieval, associative memory, and
+teacher-based distillation. A retrieval system keeps examples available at
+inference time. A teacher system transfers behavior from a stronger external
+model. TSSI does neither. The compiler sees only corpus tokens and fixed SSM
+feature coordinates, writes ternary sign/zero commitments, and then disappears.
+After import, the remaining burden is still optimized by the same original
+cross-entropy objective. This residual contract is the main semantic guardrail:
+if an import path cannot preserve it, it is not TSSI as defined in this paper.
+
+\section{Ternary Sufficient-Statistic Import}
+
+TSSI is a corpus compiler for a fixed model-coordinate view of the training
+objective. It should not be read as an attempt to solve the model in closed
+form. The compiler only asks whether the corpus gives enough first-order
+evidence to commit some ternary coordinates before the residual optimizer takes
+over.
+
+\subsection{Corpus Moment Accumulation}
+
+Let $D = \{(c_t, y_t)\}_{t=1}^T$ denote a stream of next-token contexts and
+targets. Let $\psi(c_t) \in \mathbb{R}^m$ be a fixed feature map in the
+coordinate system where the import will be written. Depending on the gate,
+$\psi$ can be a byte bigram feature, a deterministic recurrent proxy, or a live
+SSM hidden-state summary. Let $p_0(\cdot \mid c_t)$ be the reference model
+distribution before import. The cross-entropy gradient for a linearized readout
+coordinate has the form
+\begin{equation}
+  \left(p_0(\cdot \mid c_t) - e_{y_t}\right) \otimes \psi(c_t),
+\end{equation}
+where $p_0$ is the current reference distribution and $e_{y_t}$ is the one-hot
+target. TSSI accumulates this quantity over the corpus:
+\begin{equation}
+  G_D = \sum_{t=1}^T
+  \left(p_0(\cdot \mid c_t) - e_{y_t}\right) \otimes \psi(c_t).
+\end{equation}
+For the fixed feature map and reference distribution, $G_D$ is the sufficient
+statistic used by the import rule. It is not a sufficient statistic for all
+future training; it is sufficient only for the bounded question asked here:
+which ternary coordinates have stable first-order CE evidence?
+
+\subsection{Ternary Realization}
+
+The imported artifact $\theta_I$ is a ternary sign/zero commitment. Since
+$G_D[j]$ is a gradient coordinate, a positive value points toward decreasing the
+parameter and a negative value points toward increasing it. The ternary import
+therefore commits in the descent direction:
+\begin{equation}
+  \theta_I[j] =
+  \begin{cases}
+    -1 & \text{if } G_D[j] > \tau_j, \\
+     0 & \text{if } |G_D[j]| \leq \tau_j, \\
+    +1 & \text{if } G_D[j] < -\tau_j.
+  \end{cases}
+\end{equation}
+The thresholds $\tau_j$ implement abstention. They can be set by a target
+density, by calibration data, or by a coordinate-wise confidence rule. The
+important property is semantic, not cosmetic: zero means ``do not claim this
+coordinate yet.'' It keeps uncertain coordinates available for residual
+training instead of converting weak corpus evidence into wrong signs.
+
+\subsection{Why This Is an Import}
+
+The imported object is smaller than a dataset and weaker than a trained model.
+It contains no examples and no token-addressable memory. It also does not
+contain real-valued magnitudes except through the choice of which ternary cells
+are committed and which are left at zero. This is the reason the mechanism is
+natural for ternary SSMs. The compiler is not trying to discover a full
+continuous solution; it is trying to answer the first discrete layer of the
+training problem.
+
+\subsection{Residual Original-CE Contract}
+
+After import, the model is still trained on the original objective. Let
+$\delta$ denote the remaining trainable degrees of freedom, including
+uncommitted ternary coordinates and any residual capacity. The post-import
+training problem is
+\begin{equation}
+  \min_\delta \; \mathrm{CE}_D(\operatorname{realize}(\theta_I, \delta)).
+\end{equation}
+This contract is the guardrail that makes TSSI a training mechanism. If the
+import writes helpful signs, residual training begins from a better ternary
+artifact. If the import writes harmful signs, the original CE objective exposes
+the harm. No alternative loss, teacher target, or retrieval path is introduced.
+
+\subsection{Failure Modes}
+
+The definition deliberately leaves room for failure. The feature map may be too
+weak, the corpus may not provide stable signs, the thresholds may admit harmful
+coordinates, or the imported coordinates may help a proxy but fail in live SSM
+state space. These are empirical and mathematical failure modes, not
+implementation details. The validation protocol in the next section is built
+to attack them directly.
+
+\section{Validation Protocol}
+
+The validation target is not to show that an imported artifact looks good on
+the same examples that created it. The target is narrower and stricter: a TSSI
+artifact must improve held-out cross-entropy or held-out CE-gradient sign
+alignment in a way that cannot be explained by density, sign balance, logit
+scale, or example leakage.
+
+\subsection{Identifying Checks}
+
+The first identifying checks compare the imported artifact $\theta_I$ against a
+reference start $\theta_{\mathrm{ref}}$ and density-matched random ternary
+artifacts. The import is identifying only if
+\begin{align}
+  A_{\mathrm{sign}} &> A_{\mathrm{random}} + \mathrm{margin}, \\
+  \mathrm{CE}(\theta_I) &< \mathrm{CE}(\theta_{\mathrm{ref}})
+  \quad \text{on held-out data}.
+\end{align}
+Here $A_{\mathrm{sign}}$ measures agreement between the imported signs and
+held-out CE descent signs. The second check asks whether those signs matter for
+prediction, not just for a sign metric. A high alignment score without held-out
+CE improvement is treated as insufficient.
+
+\subsection{Train, Calibration, And Held-Out Separation}
+
+The corpus stream is split into training, calibration, and held-out regions.
+The training region accumulates $G_D$. The calibration region selects density,
+scale, or threshold parameters. The held-out region is not used by either step.
+This separation is necessary because TSSI can otherwise collapse into a
+corpus-specific table that looks useful only on the evidence used to build it.
+For the byte-level gates below, the main split is
+300,000/100,000/100,000 tokens from \texttt{wiki\_1mb.bin}.
+
+\subsection{Controls}
+
+Each control removes a different easy explanation.
+
+\paragraph{Zero or uniform start.}
+This baseline tests whether the imported artifact improves the reference
+cross-entropy at all.
+
+\paragraph{Density-matched random ternary start.}
+This baseline preserves sparsity and ternary occupancy while destroying corpus
+placement. Passing it means the result is not simply caused by putting enough
+nonzero signs into the readout or state summary.
+
+\paragraph{Sign-shuffled start.}
+This baseline preserves the empirical sign multiset while breaking the
+association between signs and coordinates. Passing it means the coordinate
+placement carries information.
+
+\paragraph{Layer-summary controls.}
+For live SSM states, \texttt{all}, \texttt{last}, and \texttt{mean} layer
+summaries test whether the signal depends on the full recurrent state structure
+or survives only as a weak pooled trace.
+
+\subsection{Record-Disjoint Rotations}
+
+The strongest leakage concern is that a small trace may let the compiler learn
+the flattened examples rather than a reusable state-coordinate statistic.
+Record-disjoint rotations address this by holding out whole trace records and
+rotating the held-out pair. A result that survives every rotation is not proof
+against all memorization, but it rules out the simplest explanation: one lucky
+held-out suffix or direct flattened-example reuse.
+
+\subsection{Cost Requirement}
+
+An end-to-end training claim requires:
+\begin{equation}
+  R_{\mathrm{TSSI}} =
+  h_{\mathrm{build}} + h_{\mathrm{realize}} + h_{\mathrm{verify}}
+  + \kappa_{\mathrm{res}} \frac{H_{\mathrm{res}}}{H_0}
+  \leq 0.90.
+\end{equation}
+This inequality is a deployment requirement, not the definition of TSSI. The
+present paper focuses on whether the imported ternary artifact carries useful
+cross-entropy information in model coordinates.
+
+\subsection{Kill Criteria}
+
+TSSI should be rejected, or at least demoted, under any of the following
+conditions: held-out CE fails to beat matched random controls; sign alignment is
+high but prediction does not improve; sign-shuffled controls match the import;
+record-disjoint rotations collapse; live SSM coordinates lose the signal seen
+in symbolic proxies; or residual CE training exposes the imported signs as
+harmful. These are not secondary checks. They are part of the definition of a
+useful import.
+
+\section{Experiments}
+
+The experiments are organized as an evidence ladder. The first gate asks
+whether corpus moments can produce useful ternary signs in a simple byte-level
+feature map. The second asks whether the imported artifact remains useful after
+ordinary residual CE training begins. The third replaces symbolic features with
+stateful recurrent features. The fourth uses live Vulkan SSM hidden states. The
+last gate rotates held-out trace records to reduce the risk that the live result
+is a small-trace artifact.
+
+\subsection{Byte-Level Corpus Moment Gate}
+
+The initial byte-level gate used \texttt{wiki\_1mb.bin} with 500,000 tokens and
+a 300,000/100,000/100,000 train/calibration/held-out split. The selected
+feature map was a bigram map, with density $0.05$ and scale $2.4$. The imported
+artifact reached held-out CE $2.949221092857901$, compared with uniform CE
+$5.545177444479562$ and random held-out CE mean $5.722178622339609$. The
+weighted sign alignment was $0.9986051321029663$, versus random mean
+$0.45805180817842484$.
+
+This is the first important separation. The imported signs are not merely
+nonzero ternary noise. They agree with held-out CE descent directions and reduce
+held-out CE in the same gate.
+
+\subsection{Residual Original-CE Pilot}
+
+The byte/bigram result could still be an initialization illusion: an artifact
+may look good before training, then lose its advantage once residual parameters
+start moving. To test this, a residual dense readout was trained on top of fixed
+imported or control logits under the same original CE target. After 1,000
+residual steps, TSSI reached final CE $2.5494919515235193$. The best control
+reached final CE $2.78477980855248$, giving a same-budget CE advantage of
+$0.2352878570289607$. The sign-shuffled control finished at
+$3.2129224560678225$ and did not reach the imported target.
+
+This pilot matters semantically because it tests the residual contract directly.
+The imported artifact does not merely lower an initial diagnostic number; it
+leaves the residual learner in a better CE state than zero, random, or
+sign-shuffled starts in this scope.
+
+\subsection{Stateful Proxy and Live SSM Trace}
+
+The next concern is that a byte bigram feature map may be too close to a direct
+local statistics table. A deterministic recurrent \texttt{ssm\_state} proxy was
+therefore used as a stateful feature map. With density $0.01$ and scale $1.6$,
+two residual-pilot seeds preserved the advantage: seed $777$ produced
+same-budget CE advantage $0.05614244344347741$, and seed $419$ produced
+$0.05664628606735311$.
+
+The stronger test used actual Vulkan SSM hidden states. The trace had shape
+$10 \times 6 \times 1 \times 1024 \times 128$ and, after materialization from
+\texttt{vulkan\_fwd\_h\_cache}, all $7,864,320$ hidden-state values were
+nonzero. The best all-layer import used density $0.05$ and scale $3.2$,
+reaching held-out CE $5.346169927602639$ versus random held-out CE mean
+$5.54442637453797$. Weighted sign alignment was $0.9970957040786743$, versus
+random mean $0.5062233805656433$. Under the residual pilot, the same-budget CE
+advantage was $0.19843119959677402$.
+
+The live trace is the current nucleus of the result. It moves TSSI from a
+symbolic corpus statistic into the coordinate system the model actually uses.
+
+\subsection{Record-Disjoint Anti-Memorization Gate}
+
+The live trace is small, so the anti-memorization gate is essential. The trace
+was split into records, and every two-record block was held out once under
+rotations $(8,9)$, $(0,1)$, $(2,3)$, $(4,5)$, and $(6,7)$. All five all-layer
+rotations passed. The CE margin versus the best density-matched random minimum
+had min $0.189190727524743$, mean $0.204293772528715$, and max
+$0.238266453598485$. Weighted sign alignment stayed at least
+$0.9929543137550354$.
+
+Last-layer and mean-layer summaries also passed all rotations, but with weaker
+mean margins: $0.0327855562301441$ for last-layer summaries and
+$0.013581927197886$ for mean-layer summaries. This supports the interpretation
+that the all-layer state carries the strongest corpus-directional statistic.
+The weaker summaries are useful controls, not the main result.
+
+\section{Analysis}
+
+The main result is not that a bigram feature map can predict bytes. That would
+be too weak and too close to a conventional count table. The meaningful result
+is that the same import idea survives a sequence of increasingly hostile
+reinterpretations: it survives held-out CE, sign-shuffled controls, residual
+training, a recurrent proxy, live SSM hidden-state coordinates, and
+record-disjoint rotations.
+
+\paragraph{The live all-layer trace is the nucleus.}
+The all-layer Vulkan trace is the strongest current evidence because it places
+the statistic in the actual recurrent state coordinates of the model. A
+byte-level or bigram gate can be useful as an identifying probe, but it does not
+by itself establish that TSSI is a model-native object. The live trace changes
+the status of the idea: the corpus-derived signs are no longer only symbolic
+features over token neighborhoods; they are useful over hidden states produced
+by the SSM path.
+
+\paragraph{The controls remove simple explanations.}
+The density-matched random controls remove the explanation that any sparse
+ternary pattern helps. The sign-shuffled controls remove the explanation that
+the sign balance alone is enough. The residual pilots remove the explanation
+that the import only wins before optimization begins. Record-disjoint rotations
+remove the simplest small-trace leakage story. None of these checks proves the
+mechanism at full scale, but together they make the positive signal hard to
+dismiss as formatting, density, or one lucky split.
+
+\paragraph{The result is still narrower than a trained model.}
+TSSI should be read as a partial commitment mechanism. It does not know the
+whole model. It does not decide every ternary coordinate. It does not claim that
+the imported artifact is a final parameter state. Its job is to move a subset
+of sign/zero decisions from iterative discovery into a corpus-statistic
+compiler, while leaving the residual CE problem alive. That is exactly why the
+zero state matters: the mechanism has a way to say ``not enough evidence.''
+
+\paragraph{Why the idea is project-specific.}
+The small ternary alphabet is not an incidental implementation detail. It is
+what makes the import question well-posed. For a real-valued model, the corpus
+would need to justify a magnitude, scale, and interaction pattern. For a
+ternary SSM, the compiler can ask a sharper first question: should this
+coordinate begin negative, zero, or positive under the original CE geometry?
+That makes TSSI different from generic data-dependent initialization. It is not
+only using data before training; it is using data to answer the discrete
+commitment question that this model family actually exposes.
+
+\section{Limitations}
+
+The current evidence is intentionally limited. These limitations are not
+decorative; they define what the paper can honestly claim.
+
+\paragraph{Byte-level data.}
+The gates use byte-level shards rather than a full BPE or unigram tokenizer
+pipeline. This makes the first experiments simple and repeatable, but it leaves
+open whether the same import signal holds under the tokenization and sequence
+statistics used by larger language-model training runs.
+
+\paragraph{Small live trace.}
+The live Vulkan SSM evidence comes from a 10-step batch-1 trace. The trace is
+valuable because it is real model state, but it is still small. Record-disjoint
+rotations reduce the easiest leakage concern, yet they do not replace a larger
+corpus-scale live-state validation.
+
+\paragraph{Fixed feature maps.}
+TSSI is only as good as the feature map in which corpus moments are accumulated.
+A weak feature map can miss useful structure; an overly expressive feature map
+can become too close to hidden retrieval. The live all-layer result is
+encouraging because it uses SSM states, but the feature-map question is still
+central.
+
+\paragraph{Threshold selection.}
+The current gates use density, scale, and calibration choices. These are
+reasonable for identifying whether the signal exists, but a mature TSSI system
+should derive or learn threshold rules that are stable across corpora, model
+sizes, and training stages.
+
+\paragraph{No downstream capability result.}
+The evidence is CE-centered. It shows that corpus-derived ternary commitments
+can reduce held-out CE and preserve residual CE advantage in the tested scopes.
+It does not yet show downstream task improvement, long-context capability
+transfer, or full training-run behavior.
+
+\paragraph{Residual conflict remains possible.}
+An imported sign can be locally useful and still interfere with later residual
+learning. The current residual pilots did not expose that harm in the tested
+scopes, but larger models may reveal interaction effects between imported
+commitments, SSM dynamics, and later optimizer updates.
+
+\section{Conclusion}
+
+This paper introduced TSSI, a corpus-to-ternary-artifact mechanism for
+state-space language-model training. The core idea is simple: if the model's
+parameter alphabet is ternary, then a corpus can sometimes answer part of the
+initial sign/zero decision problem before iterative optimization begins. The
+right import object is not raw text, not a retrieval table, and not a teacher
+model. It is a sufficient statistic for original cross-entropy descent in a
+fixed model-coordinate feature map.
+
+The current evidence supports the mechanism. Corpus-derived ternary
+commitments beat density-matched random and sign-shuffled controls, survive
+residual original-CE training, remain useful in a recurrent state proxy, and
+carry signal over live Vulkan SSM hidden states. Record-disjoint rotations
+further show that the strongest all-layer live-state result is not explained by
+a single held-out suffix or trivial flattened-example reuse.
+
+The next experiment is direct: build a model-native TSSI path that accumulates
+the same kind of corpus moments without relying on an offline trace export,
+then compare imported, zero, random, and sign-shuffled starts under residual
+original-CE training at larger corpus and model scale. If that holds, TSSI
+becomes more than an identifying gate. It becomes a new way to make the corpus
+participate in constructing the initial ternary model state.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

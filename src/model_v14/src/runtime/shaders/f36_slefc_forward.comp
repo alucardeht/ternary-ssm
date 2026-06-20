@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer HIn { float h_in[]; };
+layout(set = 0, binding = 1) buffer SignsOut { uint signs_out[]; };
+layout(set = 0, binding = 2) buffer NormOut { float norm_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.d_state) return;
+
+    float sum_abs = 0.0;
+    for (uint t = 0; t < pc.seq_len; ++t) {
+        uint idx = t * pc.d_state + c;
+        float val = h_in[idx];
+        sum_abs += abs(val);
+        
+        uint sign_bit = (val >= 0.0) ? 1 : 0;
+        uint word_idx = idx / 32;
+        uint bit_offset = idx % 32;
+        atomicOr(signs_out[word_idx], sign_bit << bit_offset);
+    }
+    norm_out[c] = sum_abs / float(pc.seq_len);
+}

@@ -1,0 +1,38 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BufData { float data[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+shared float s[128];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;  /* batch index */
+    uint j = gl_LocalInvocationID.x;
+    if (t >= pc.seq_len || j >= pc.d_state) return;
+
+    uint idx = (b * pc.seq_len + t) * pc.d_state + j;
+    s[j] = data[idx];
+    barrier();
+
+    for (uint wht_stride = 1u; wht_stride < pc.d_state; wht_stride *= 2u) {
+        uint pair = j ^ wht_stride;
+        float a = s[j];
+        float b_val = s[pair];
+        barrier();
+        if (j < pair) {
+            s[j] = a + b_val;
+            s[pair] = a - b_val;
+        }
+        barrier();
+    }
+
+    float norm = 1.0 / sqrt(float(pc.d_state));
+    data[idx] = s[j] * norm;
+}

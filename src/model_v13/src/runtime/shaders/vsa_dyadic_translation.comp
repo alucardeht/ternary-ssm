@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(binding = 0) buffer StateIn { float in_data[]; };
+layout(binding = 1) buffer ShiftArr { uint shifts[]; };
+layout(binding = 2) buffer StateOut { float out_data[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint num_tokens;
+    uint ds; // Must be power of 2
+} p;
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    uint local_idx = gl_LocalInvocationID.x;
+    
+    if (token_idx >= p.num_tokens) return;
+    
+    // Each token has a single integer shift value that permutes its Hadamard subspace.
+    // The mask value is a float, we read it as uint. To get one value per token, we index by token_idx * p.ds.
+    uint raw_shift = shifts[token_idx * p.ds];
+    // Mix the bits to get a pseudorandom but state-dependent shift
+    raw_shift = raw_shift ^ (raw_shift >> 16);
+    uint shift = raw_shift & (p.ds - 1);
+    
+    // Each thread processes multiple elements if dimension ds > local_size_x
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        // The Galois permutation in Hadamard space is a bitwise XOR of the index
+        uint shifted_idx = i ^ shift;
+        out_data[token_idx * p.ds + i] = in_data[token_idx * p.ds + shifted_idx];
+    }
+}

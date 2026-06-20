@@ -1,0 +1,92 @@
+#version 450
+
+/* Fused elementwise gates for SSM layer:
+ * 1. Soft-gate:  x_gated = x_proj * sigmoid(scale * (|x_proj| - tau))
+ * 2. Conv1d:     x_conv[t] = sum_{k=0}^{K-1} w_conv[k] * x_gated[max(t-k, 0)]
+ * 3. Direct-B:   b_eff[t] = sigmoid(x_conv[t]) * B
+ * 4. Input-dep A: a_buf[t] = A * sigmoid(W_A @ x_conv[t] + b_A)
+ *
+ * One workgroup per timestep. 128 threads = d_state dimensions.
+ * Dispatch: gridX = seq_len (512)
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+/* Buffers */
+layout(set = 0, binding = 0) readonly  buffer BufXproj   { float x_proj[]; };  /* [seq × ds] */
+layout(set = 0, binding = 1) readonly  buffer BufWconv   { float w_conv[]; };  /* [K × ds] */
+layout(set = 0, binding = 2) readonly  buffer BufB       { float B[];      };  /* [ds] */
+layout(set = 0, binding = 3) readonly  buffer BufA       { float A[];      };  /* [ds] */
+layout(set = 0, binding = 4) readonly  buffer BufWA      { float W_A[];    };  /* [ds × ds] */
+layout(set = 0, binding = 5) readonly  buffer BufbA      { float b_A[];    };  /* [ds] */
+layout(set = 0, binding = 6) writeonly buffer BufAbuf       { float a_buf[];        };  /* [seq × ds] */
+layout(set = 0, binding = 7) writeonly buffer BufBeff       { float b_eff[];        };  /* [seq × ds] */
+layout(set = 0, binding = 8) writeonly buffer BufXcv        { float x_cv[];         };  /* [seq × ds] */
+layout(set = 0, binding = 9) writeonly buffer BufXgated     { float x_gated_out[];  };  /* [seq × ds] */
+layout(set = 0, binding = 10) writeonly buffer BufMaskVal   { float mask_val_out[]; };  /* [seq × ds] */
+
+layout(push_constant) uniform PC {
+    uint seq_len;       /* 512 */
+    uint d_state;       /* 128 */
+    float tau;          /* tau_mux for this layer */
+    float scale;        /* V12_SOFT_BOUNDARY_SCALE = 10.0 */
+} pc;
+
+shared float s_xconv[128];  /* shared x_conv for W_A GEMV broadcast */
+
+void main() {
+    uint t = gl_WorkGroupID.x;     /* timestep [0..511] */
+    uint b = gl_WorkGroupID.y;     /* batch index */
+    uint i = gl_LocalInvocationID.x;  /* state dim [0..127] */
+
+    if (t >= pc.seq_len || i >= pc.d_state) return;
+
+    uint ds = pc.d_state;
+    uint base_ds = b * pc.seq_len * ds;
+
+    /* --- Step 1: Soft-gate --- */
+    /* Need x_gated for conv kernel taps t, t-1, t-2, t-3 */
+    /* Compute x_gated inline for each tap; tap 0 (current t) is saved for output */
+    float xp_cur = x_proj[base_ds + t * ds + i];
+    float mask_cur = 1.0 / (1.0 + exp(-pc.scale * (abs(xp_cur) - pc.tau)));
+    float x_gated_cur = xp_cur * mask_cur;
+
+    float x_gated_taps[4];
+    x_gated_taps[0] = x_gated_cur;
+    for (int k = 1; k < 4; k++) {
+        int src_t = int(t) - k;
+        if (src_t < 0) src_t = 0;  /* causal padding — stays within same batch item */
+        float xp = x_proj[base_ds + src_t * ds + i];
+        float gate = 1.0 / (1.0 + exp(-pc.scale * (abs(xp) - pc.tau)));
+        x_gated_taps[k] = xp * gate;
+    }
+
+    /* --- Step 2: Conv1d (causal, depthwise) --- */
+    float xc = 0.0;
+    for (int k = 0; k < 4; k++) {
+        xc += w_conv[k * ds + i] * x_gated_taps[k];
+    }
+
+    /* Store x_conv for output and shared broadcast */
+    uint idx = base_ds + t * ds + i;
+    x_cv[idx] = xc;
+    s_xconv[i] = xc;
+
+    barrier();
+
+    /* --- Step 3: Direct-B gate --- */
+    float b_gate = 1.0 / (1.0 + exp(-xc));
+    b_eff[idx] = b_gate * B[i];
+
+    /* --- Step 4: Input-dependent A --- */
+    /* dot = W_A[i, :] @ x_conv[:] + b_A[i] */
+    float dot = b_A[i];
+    for (uint j = 0; j < ds; j++) {
+        dot += W_A[i * ds + j] * s_xconv[j];
+    }
+    float a_gate = 1.0 / (1.0 + exp(-dot));  /* sigmoid */
+    a_buf[idx] = (-log(1.0 + exp(A[i])) - 0.001) * a_gate;
+
+    /* --- Store per-layer forward activations needed by backward pass --- */
+    x_gated_out[idx]   = x_gated_cur;
+    mask_val_out[idx]   = mask_cur;
+}

@@ -1,0 +1,22 @@
+#version 450
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BufH { float h_cache[]; };
+layout(set = 0, binding = 1) readonly buffer BufWht { float whitening_matrix[]; };
+
+layout(push_constant) uniform PC {
+    uint batch_size;
+    uint seq_len;
+    uint d_state;
+} pc;
+
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    if (i >= pc.d_state) return;
+
+    float w = whitening_matrix[i];
+    uint total = pc.batch_size * pc.seq_len;
+    for (uint bt = 0; bt < total; bt++) {
+        h_cache[bt * pc.d_state + i] *= w;
+    }
+}

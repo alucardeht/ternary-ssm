@@ -1,0 +1,111 @@
+#version 450
+
+/* SSM Augmented Associative Scan (AAS-SS) under LR-DTP (R495 A01)
+ *
+ * Computes:
+ *   w[t-1] = sum_i(v[i] * h[t-1][i])
+ *   h[t][i] = A_eff[t][i] * h[t-1][i] + B_eff[t][i] * x[t][i] + w[t-1] * u[i]
+ *
+ * Running in a single workgroup per batch element.
+ * 128 threads per workgroup, each thread handles one channel index (dim).
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; };   /* [seq_len × d_state] */
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; };   /* [seq_len × d_state] */
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x[];     };   /* [seq_len × d_state] */
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  };   /* [d_state] */
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; };   /* [seq_len × d_state] */
+layout(set = 0, binding = 5) readonly  buffer BufU    { float u_vec[]; };   /* [d_state] */
+layout(set = 0, binding = 6) readonly  buffer BufV    { float v_vec[]; };   /* [d_state] */
+
+layout(push_constant) uniform PC {
+    uint seq_len;       /* 512 */
+    uint d_state;       /* 128 */
+    uint has_bilinear;  /* 1 if C_bilinear active, 0 otherwise */
+} pc;
+
+shared float sh_h[128];
+shared float sh_w[128];
+shared float sh_w_val;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint b   = gl_WorkGroupID.y;  /* batch index */
+
+    if (tid >= pc.d_state) return;
+
+    uint T = pc.seq_len;
+    uint batch_base = b * T * pc.d_state;
+
+    // Initialize hidden state
+    sh_h[tid] = 0.0f;
+    barrier();
+
+    for (uint t = 0; t < T; ++t) {
+        uint idx = batch_base + t * pc.d_state + tid;
+        
+        float a_eff_val = A_eff[idx];
+        float x_val = x[idx];
+        float b_eff_val = B_eff[idx];
+
+        // Bilinear: A_total = A_eff + C_bl * x
+        if (pc.has_bilinear != 0u) {
+            a_eff_val += C_bl[tid] * x_val;
+        }
+
+        // Clamp for numerical stability (R351)
+        float a_clamped = clamp(a_eff_val, 0.01f, 0.817f);
+
+        // Compute term for w_{t-1} = v^T h_{t-1}
+        float term = v_vec[tid] * sh_h[tid];
+        sh_w[tid] = term;
+        barrier();
+
+        // Parallel reduction of sh_w over 128 threads
+        if (tid < 64u) { sh_w[tid] += sh_w[tid + 64u]; } barrier();
+        if (tid < 32u) { sh_w[tid] += sh_w[tid + 32u]; } barrier();
+        if (tid < 16u) { sh_w[tid] += sh_w[tid + 16u]; } barrier();
+        if (tid < 8u)  { sh_w[tid] += sh_w[tid + 8u];  } barrier();
+        if (tid < 4u)  { sh_w[tid] += sh_w[tid + 4u];  } barrier();
+        if (tid < 2u)  { sh_w[tid] += sh_w[tid + 2u];  } barrier();
+        if (tid < 1u)  { sh_w[tid] += sh_w[tid + 1u];  } barrier();
+
+        if (tid == 0u) {
+            sh_w_val = sh_w[0];
+        }
+        barrier();
+
+        // Symplectic Integrator State-Space Flow (SIS-SF)
+        uint half_d = pc.d_state / 2;
+        if (tid < half_d) {
+            float q_prev = sh_h[tid];
+            float p_prev = sh_h[tid + half_d];
+            float w_q = a_clamped;
+            float w_x = b_eff_val;
+            float m_inv = A_eff[batch_base + t * pc.d_state + tid + half_d];
+            m_inv = clamp(m_inv, 0.01f, 0.817f);
+
+            float v_prev = w_q * q_prev + w_x * x_val;
+            float tanh_v_prev = tanh(v_prev);
+            float grad_q_prev = -w_q * (1.0f - tanh_v_prev * tanh_v_prev);
+            float p_half = p_prev - 0.5f * grad_q_prev;
+
+            float q_new = q_prev + m_inv * p_half;
+            q_new += sh_w_val * u_vec[tid];
+
+            float v_new = w_q * q_new + w_x * x_val;
+            float tanh_v_new = tanh(v_new);
+            float grad_q_new = -w_q * (1.0f - tanh_v_new * tanh_v_new);
+            float p_new = p_half - 0.5f * grad_q_new;
+            p_new += sh_w_val * u_vec[tid + half_d];
+
+            sh_h[tid] = q_new;
+            sh_h[tid + half_d] = p_new;
+
+            h_out[idx] = q_new;
+            h_out[idx + half_d] = p_new;
+        }
+        barrier();
+    }
+}

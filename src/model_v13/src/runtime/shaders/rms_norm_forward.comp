@@ -1,0 +1,64 @@
+#version 450
+
+/* RMS Norm Forward: y[t,j] = gamma[j] * (x[t,j] / rms[t]) + beta[j]
+ * where rms[t] = sqrt(mean_j(x[t,j]^2) + eps)
+ *
+ * One workgroup per timestep (512).
+ * 256 threads reduce sum-of-squares, then normalize.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufX     { float x[];     };
+layout(set = 0, binding = 1) readonly  buffer BufGamma { float gamma[]; };
+layout(set = 0, binding = 2) readonly  buffer BufBeta  { float beta[];  };
+layout(set = 0, binding = 3) writeonly buffer BufY     { float y[];     };
+layout(set = 0, binding = 4) writeonly buffer BufRms   { float rms_out[];};
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d;
+    float eps;
+} pc;
+
+shared float s_sum[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;  /* batch index */
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= pc.seq_len) return;
+
+    uint base = (b * pc.seq_len + t) * pc.d;
+    uint ept = pc.d / 256u;
+
+    /* Phase 1: partial sum of squares */
+    float local_ss = 0.0;
+    for (uint e = 0u; e < ept; e++) {
+        uint j = tid * ept + e;
+        if (j < pc.d) {
+            float v = x[base + j];
+            local_ss += v * v;
+        }
+    }
+    s_sum[tid] = local_ss;
+    barrier();
+
+    /* Phase 2: tree reduction */
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        barrier();
+    }
+
+    float r = sqrt(s_sum[0] / float(pc.d) + pc.eps);
+    if (tid == 0u) rms_out[b * pc.seq_len + t] = r;
+    float inv_rms = 1.0 / r;
+
+    /* Phase 3: normalize + scale + shift */
+    /* gamma/beta are per-dimension weight vectors shared across batch */
+    for (uint e = 0u; e < ept; e++) {
+        uint j = tid * ept + e;
+        if (j < pc.d) {
+            y[base + j] = gamma[j] * (x[base + j] * inv_rms) + beta[j];
+        }
+    }
+}

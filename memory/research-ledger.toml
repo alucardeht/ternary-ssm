@@ -1,0 +1,17 @@
+[meta]
+version = 1
+updated = "2026-05-20"
+purpose = "Compact structured research graph truth. Generated indexes derive from this file."
+
+[split]
+generated_by = "scripts/maintenance/split_hot_memory_files.py"
+generated_at = "2026-05-22T01:28:46"
+split_shard_dir = "memory/ledgers/research"
+cold_backup = ".work/context-heavy/docs-raw/2026-05-22-hot-memory-split/research-ledger.toml"
+target_shard_kb = 60
+shards = [
+  "memory/ledgers/research/research-001.toml",
+  "memory/ledgers/research/research-002.toml",
+  "memory/ledgers/research/research-003.toml",
+  "memory/ledgers/research/research-004.toml",
+]

@@ -1,0 +1,38 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuf {
+    uint in_data[];
+};
+layout(set = 0, binding = 1) writeonly buffer OutBuf {
+    float out_data[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint total_elements;
+} pc;
+
+#define SQRT2_INV 0.7071067811865475
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id * 4 >= pc.total_elements) return;
+
+    vec4 v = unpackSnorm4x8(in_data[id]);
+
+    float sq1 = v.x;
+    float sp1 = v.y;
+    float sq2 = v.z;
+    float sp2 = v.w;
+
+    // Inverse structure-preserving symplectic mapping
+    float q1 = (sq1 + sp1) * SQRT2_INV;
+    float p1 = (sq1 - sp1) * SQRT2_INV;
+    float q2 = (sq2 + sp2) * SQRT2_INV;
+    float p2 = (sq2 - sp2) * SQRT2_INV;
+
+    out_data[id * 4 + 0] = q1;
+    out_data[id * 4 + 1] = p1;
+    out_data[id * 4 + 2] = q2;
+    out_data[id * 4 + 3] = p2;
+}

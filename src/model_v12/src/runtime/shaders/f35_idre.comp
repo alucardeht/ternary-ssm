@@ -1,0 +1,39 @@
+#version 450
+
+/* R504 - Finding 4: Implicit Differentiation of Recurrent Equilibrium (IDRE)
+ * Replaces BPTT graph caching with a fixed-point theorem evaluation.
+ * lambda_eq = (I - partial_h F_eq)^-T \nabla_h L_eq
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufV { float v[]; };
+layout(set = 0, binding = 2) writeonly buffer BufD { float dh_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint horizon; // unused, to match dispatch signature
+} pc;
+
+void main() {
+    uint dim = gl_GlobalInvocationID.x;
+    uint t   = gl_GlobalInvocationID.y;
+    uint b   = gl_GlobalInvocationID.z;
+
+    if (dim >= pc.d_state || t >= pc.seq_len) return;
+
+    uint T = pc.seq_len;
+    uint batch_base = b * T * pc.d_state;
+    uint idx = batch_base + t * pc.d_state + dim;
+
+    /* For adjoint, A is evaluated at t+1 if possible */
+    float a_val = (t + 1u < T) ? A_eff[batch_base + (t + 1u) * pc.d_state + dim] : 1.0;
+    a_val = clamp(a_val, 0.01, 0.817);
+
+    // IDRE Fixed Point Evaluation: \lambda = v / (1 - A)
+    float denom = 1.0 - a_val;
+    if (denom < 1e-5) denom = 1e-5; // numerical safety
+
+    dh_out[idx] = v[idx] / denom;
+}

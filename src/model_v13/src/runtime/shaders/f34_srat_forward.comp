@@ -1,0 +1,26 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer HIn { float h_in[]; };
+layout(set = 0, binding = 1) buffer Pr { float p_r[]; };
+layout(set = 0, binding = 2) buffer ZOut { float z_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint d_state;
+    uint r;
+} pc;
+
+void main() {
+    uint z_idx = gl_GlobalInvocationID.x;
+    uint total_z = pc.seq_len * pc.r;
+    if (z_idx >= total_z) return;
+    
+    uint t = z_idx / pc.r;
+    uint i = z_idx % pc.r;
+    
+    float val = 0.0;
+    for (uint j = 0; j < pc.d_state; ++j) {
+        val += h_in[t * pc.d_state + j] * p_r[j * pc.r + i];
+    }
+    z_out[z_idx] = val;
+}

@@ -1,0 +1,149 @@
+#version 450
+
+/* SSM Backward Replay F1 (R356) — reconstructed via parallel associative scan (PAAS).
+ *
+ * Walks t = T-1..0 per channel and inverts the diagonal bilinear recurrence:
+ *     h[t-1][i] = (h[t][i] - B_eff[t][i]*x[t][i]) / A_tot_i[t]
+ *
+ * In parallel:
+ *     sa0[t].A = A'_{t+1}, sa0[t].g = g'_{t+1}   for t in [0, T-2]
+ *     sa0[T-1].A = 1.0,    sa0[T-1].g = h_final
+ *
+ * Suffix compose right-to-left: element t absorbs from element t + stride
+ *     tree[t] = tree[t] compose tree[t + stride]
+ *
+ * Dispatch: local_size_x = 256
+ *     gl_WorkGroupID.x = channel/state index
+ *     gl_WorkGroupID.y = batch index
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA          { float A[];           }; /* [d_state] direct decay */
+layout(set = 0, binding = 1) readonly  buffer BufAperStep   { float A_per_step[];  }; /* [T*d_state] or unused   */
+layout(set = 0, binding = 2) readonly  buffer BufDt         { float dt_buf[];      }; /* [T] or unused           */
+layout(set = 0, binding = 3) readonly  buffer BufBeff       { float B_eff[];       }; /* [B*T*d_state]           */
+layout(set = 0, binding = 4) readonly  buffer BufX          { float x_buf[];       }; /* [B*T*d_state]           */
+layout(set = 0, binding = 5) readonly  buffer BufCbl        { float C_bl[];        }; /* [d_state]               */
+layout(set = 0, binding = 6) readonly  buffer BufHfinal     { float h_final[];     }; /* [B*d_state]             */
+layout(set = 0, binding = 7) readonly  buffer BufBoundary   { uint  boundary[];    }; /* [T] packed uint8 or 0   */
+layout(set = 0, binding = 8) writeonly buffer BufHrepl      { float h_repl[];      }; /* [B*T*d_state]           */
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint has_bilinear;    /* 1 if C_bilinear active, 0 otherwise                        */
+    uint a_mode;          /* 0 = time-invariant (A only), 1 = A_per_step, 2 = dt-scaled */
+    uint has_boundary;    /* 1 if boundary mask is bound, 0 otherwise                   */
+} pc;
+
+const float DENOM_EPS = 1e-6;
+
+/* Double-buffered shared memory arrays (supporting up to T = 1024) */
+shared float sa0[1024];
+shared float sb0[1024];
+shared float sa1[1024];
+shared float sb1[1024];
+
+void main() {
+    uint dim = gl_WorkGroupID.x;  /* channel/state index */
+    uint b   = gl_WorkGroupID.y;  /* batch index */
+    uint tid = gl_LocalInvocationID.x;
+
+    if (dim >= pc.d_state) return;
+
+    uint T = pc.seq_len;
+    uint ds = pc.d_state;
+    uint batch_base = b * T * ds;
+
+    /* --- Phase 0: Load inputs into shared memory --- */
+    for (uint t = tid; t < T; t += 256u) {
+        if (t == T - 1u) {
+            /* Boundary condition: at T-1, composed pair is (1.0, h_final) */
+            sa0[t] = 1.0;
+            sb0[t] = h_final[b * ds + dim];
+        } else {
+            uint step = t + 1u;
+            
+            bool at_boundary = false;
+            if (pc.has_boundary != 0u) {
+                at_boundary = (boundary[step] != 0u);
+            }
+
+            if (at_boundary) {
+                /* Reset backward: h[step-1] is forced to 0.0 */
+                sa0[t] = 0.0;
+                sb0[t] = 0.0;
+            } else {
+                /* Compute A'_step and g'_step */
+                float a_eff;
+                if (pc.a_mode == 1u) {
+                    a_eff = A_per_step[step * ds + dim];
+                } else if (pc.a_mode == 2u) {
+                    a_eff = exp(dt_buf[step] * log(A[dim]));
+                } else {
+                    a_eff = A[dim];
+                }
+
+                uint idx = batch_base + step * ds + dim;
+                float x_val = x_buf[idx];
+                float b_val = B_eff[idx];
+
+                float a_tot = a_eff;
+                if (pc.has_bilinear != 0u) {
+                    a_tot += C_bl[dim] * x_val;
+                }
+
+                float a_mag = abs(a_tot);
+                if (a_mag < DENOM_EPS) {
+                    a_tot = (a_tot < 0.0) ? -DENOM_EPS : DENOM_EPS;
+                }
+
+                sa0[t] = 1.0 / a_tot;
+                sb0[t] = - (b_val * x_val) / a_tot;
+            }
+        }
+    }
+
+    barrier();
+
+    /* --- Phase 1: Suffix scan (Hillis-Steele right-to-left) --- */
+    /* Operator compose: left (t) compose right (t + stride)
+     *     result.A = left.A * right.A
+     *     result.g = left.A * right.g + left.g
+     */
+    uint src = 0u;
+    for (uint stride = 1u; stride < T; stride *= 2u) {
+        for (uint t = tid; t < T; t += 256u) {
+            float cur_a, cur_b;
+            if (src == 0u) { cur_a = sa0[t]; cur_b = sb0[t]; }
+            else            { cur_a = sa1[t]; cur_b = sb1[t]; }
+
+            if (t + stride < T) {
+                float right_a, right_b;
+                uint right = t + stride;
+                if (src == 0u) { right_a = sa0[right]; right_b = sb0[right]; }
+                else            { right_a = sa1[right]; right_b = sb1[right]; }
+
+                float new_a = cur_a * right_a;
+                float new_b = cur_a * right_b + cur_b;
+                cur_a = new_a;
+                cur_b = new_b;
+            }
+
+            if (src == 0u) { sa1[t] = cur_a; sb1[t] = cur_b; }
+            else            { sa0[t] = cur_a; sb0[t] = cur_b; }
+        }
+        barrier();
+        src = 1u - src;
+    }
+
+    /* --- Phase 2: Write result to h_repl --- */
+    for (uint t = tid; t < T; t += 256u) {
+        float result_b;
+        if (src == 0u) result_b = sb0[t];
+        else            result_b = sb1[t];
+
+        h_repl[batch_base + t * ds + dim] = result_b;
+    }
+}

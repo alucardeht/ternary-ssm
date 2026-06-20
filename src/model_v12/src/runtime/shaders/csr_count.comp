@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) readonly buffer Sampled  { float sampled[]; };
+layout(set=0, binding=1) writeonly buffer CntPos { uint count_pos[]; };
+layout(set=0, binding=2) writeonly buffer CntNeg { uint count_neg[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; };
+
+shared uint s_pos[256], s_neg[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= rows) return;
+    uint cp = 0u, cn = 0u;
+    uint base = row * cols;
+    for (uint j = tid; j < cols; j += 256u) {
+        float v = sampled[base + j];
+        if (v > 0.5) cp++;
+        else if (v < -0.5) cn++;
+    }
+    s_pos[tid] = cp; s_neg[tid] = cn;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) { s_pos[tid] += s_pos[tid+s]; s_neg[tid] += s_neg[tid+s]; }
+        barrier();
+    }
+    if (tid == 0u) { count_pos[row] = s_pos[0]; count_neg[row] = s_neg[0]; }
+}

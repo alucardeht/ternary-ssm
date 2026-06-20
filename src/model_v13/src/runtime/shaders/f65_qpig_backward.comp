@@ -1,0 +1,56 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufParam { float param[]; };
+// In a full implementation, we'd have multiple gradient paths and their corresponding actions (losses).
+// For this single-shader proxy, we simulate the path integral effect by sampling
+// a local perturbed gradient based on a pseudorandom noise and a local action proxy.
+layout(set = 0, binding = 2) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float hbar;
+    float noise_scale;
+} pc;
+
+// Simple PRNG
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+float random_float(uint seed) {
+    return float(hash(seed)) / 4294967296.0;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Quantum Path Integral Gradients
+    // Proxy: Add structured noise to the gradient, weighted by an "action" factor
+    // that simulates the dominant path contribution.
+    
+    float g_val = g_in[idx];
+    float p_val = param[idx];
+    
+    // Generate pseudo-random noise
+    float rand_val = random_float(idx ^ hash(floatBitsToUint(g_val)));
+    float noise = (rand_val - 0.5) * 2.0 * pc.noise_scale;
+    
+    // Proxy for the local action (S). We assume higher gradient magnitude implies higher action (steeper slope)
+    float local_action = abs(g_val) * abs(p_val);
+    
+    // Weight of the "perturbed path"
+    float weight = exp(-local_action / (pc.hbar + 1e-8));
+    
+    // The gradient becomes a mix of the classical steepest descent and the perturbed path
+    float path_integral_g = g_val + weight * noise;
+    
+    g_out[idx] = path_integral_g;
+}

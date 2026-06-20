@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufHistDir { float hist_dir[]; };
+layout(set = 0, binding = 2) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float threshold;
+    float decay;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Anti-Correlated Gradient Masking
+    // We compare the current gradient with a historical update direction.
+    // If they are strongly anti-correlated (product is negative and large),
+    // we mask or dampen the gradient to prevent oscillation.
+    
+    float g_val = g_in[idx];
+    float h_val = hist_dir[idx];
+    
+    // Compute correlation proxy (element-wise product)
+    // Positive means moving in same direction, negative means oscillating
+    float corr = g_val * h_val;
+    
+    // If strongly anti-correlated, mask the gradient
+    if (corr < -pc.threshold) {
+        g_val = 0.0; // Mask out the destructive component
+    }
+    
+    // Update the historical direction (exponential moving average)
+    // We assume hist_dir tracks the sign or normalized magnitude of previous updates
+    // For simplicity, we just blend it here.
+    hist_dir[idx] = pc.decay * h_val + (1.0 - pc.decay) * g_val;
+    
+    g_out[idx] = g_val;
+}

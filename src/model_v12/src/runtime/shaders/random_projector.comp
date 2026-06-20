@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufP { float P[]; };
+
+layout(push_constant) uniform PC {
+    uint bseq;
+    uint k;
+    uint seed;
+} pc;
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.bseq * pc.k) return;
+    
+    uint h = hash(idx ^ pc.seed);
+    float val = ((h & 1u) == 0u) ? 1.0 : -1.0;
+    P[idx] = val / sqrt(float(pc.k));
+}

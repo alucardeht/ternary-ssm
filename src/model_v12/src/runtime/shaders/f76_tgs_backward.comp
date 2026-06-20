@@ -1,0 +1,31 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float diffusion_rate;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Topological Gradient Smoothing
+    // Apply structural diffusion over the gradients according to topology.
+    // Proxy: we smooth gradients of spatially proximal weights (1D neighbors).
+    
+    float g_val = g_in[idx];
+    
+    float g_left = (idx > 0) ? g_in[idx - 1] : g_val;
+    float g_right = (idx < pc.param_size - 1) ? g_in[idx + 1] : g_val;
+    
+    // Simple 1D Laplacian diffusion
+    float laplacian = (g_left + g_right - 2.0 * g_val);
+    
+    float out_g = g_val + pc.diffusion_rate * laplacian;
+    
+    g_out[idx] = out_g;
+}

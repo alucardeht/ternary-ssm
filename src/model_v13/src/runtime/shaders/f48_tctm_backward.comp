@@ -1,0 +1,34 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufCotangent { float g_t[]; };
+layout(set = 0, binding = 1) buffer BufTernaryState { float h_ternary[]; };
+layout(set = 0, binding = 2) buffer BufProjectedCotangent { float g_proj[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+    
+    // Project cotangent onto the reachable ternary simplicial complex
+    // If h_ternary is saturated (-1 or 1), gradient that pushes it further is invalid continuous interpolation
+    float h_val = h_ternary[batch_idx * pc.d_state + idx];
+    float g_val = g_t[batch_idx * pc.d_state + idx];
+    
+    // Simplistic topological boundary check:
+    // Only allow gradient flow if it moves state TOWARD the valid bounded region [-1, 1],
+    // or if the state is strictly interior.
+    float proj_g = g_val;
+    if (h_val >= 1.0 && g_val < 0.0) { // Gradient wants to push > 1
+        proj_g = 0.0;
+    } else if (h_val <= -1.0 && g_val > 0.0) { // Gradient wants to push < -1
+        proj_g = 0.0;
+    }
+    
+    g_proj[batch_idx * pc.d_state + idx] = proj_g;
+}

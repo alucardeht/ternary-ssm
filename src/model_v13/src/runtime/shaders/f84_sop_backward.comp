@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufDominantDirection { float dominant_dir[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float projection_strength;
+    float norm_epsilon;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Submanifold Orthogonal Projection
+    // Project new gradient updates to be orthogonal to the dominant directions of past updates.
+    // Proxy: we use a single `dominant_dir` vector. In full implementation, it's a subspace or multiple vectors.
+    // The projection orthogonal to d is: g' = g - (g . d) * d
+    // Since we do this element-wise as a proxy for the vector operation (assuming a block-diagonal or diagonal structure for efficiency),
+    // we'll approximate the projection.
+    
+    float g_val = g_in[idx];
+    float d_val = dominant_dir[idx]; // Normalized dominant direction component
+    
+    // As a strict element-wise proxy, we can subtract the projection of g_val onto d_val
+    // In reality, (g . d) is a scalar reduction across the whole tensor.
+    // Without full reduction in a single dispatch, we approximate it by dampening
+    // components where the dominant direction is strong.
+    
+    // Approximation: if dominant direction has a large component here, reduce the gradient
+    // along this component.
+    float proj_comp = g_val * d_val; 
+    // Out = g - strength * (g*d) * d
+    float out_g = g_val - pc.projection_strength * proj_comp * d_val;
+    
+    g_out[idx] = out_g;
+}

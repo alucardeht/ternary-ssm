@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer FwdH { float fwd_h[]; };
+layout(set = 0, binding = 1) buffer Basis { float basis[]; };
+layout(set = 0, binding = 2) buffer Ternary { uint ternary[]; };
+
+layout(push_constant) uniform Push {
+    uint total_elements;
+} push;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= push.total_elements) return;
+
+    float val = fwd_h[idx];
+    
+    // QRF3AC: Store input basis and ternary coefficients
+    basis[idx] = abs(val);
+    
+    uint t;
+    if (val > 0.0) {
+        t = 2; // +1
+    } else if (val < 0.0) {
+        t = 0; // -1
+    } else {
+        t = 1; // 0
+    }
+    ternary[idx] = t;
+}

@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufPhaseAccumulator { float phase[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float phase_coupling; // How strongly the geometric phase modifies the gradient
+    float cycle_damping; // Decay of the phase accumulator
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Geometric Phase Accumulation
+    // As parameters oscillate, they enclose an area (or accumulate a proxy "phase").
+    // The phase modifies the effective gradient to break limit cycles.
+    // Proxy: we accumulate the gradient's sign flips or orthogonal components over time.
+    // A simple 1D proxy for "phase" accumulation during oscillation is tracking
+    // the running integral of the gradient, and using its relation to the current gradient.
+    
+    float g_val = g_in[idx];
+    float p_val = phase[idx];
+    
+    // Phase update: if g_val opposes p_val, we are oscillating.
+    // p_val tracks the "center" of the oscillation.
+    float new_p = p_val * (1.0 - pc.cycle_damping) + g_val;
+    
+    // Modification: if we are oscillating (g_val opposes new_p), we dampen the gradient.
+    float out_g = g_val;
+    if (sign(g_val) != sign(new_p) && sign(new_p) != 0.0) {
+        // Geometric phase indicates an oscillatory limit cycle. Apply damping.
+        out_g *= (1.0 - pc.phase_coupling);
+    }
+    
+    phase[idx] = new_p;
+    g_out[idx] = out_g;
+}

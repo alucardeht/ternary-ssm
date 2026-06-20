@@ -1,0 +1,35 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufSubspaceEntropy { float subspace_entropy[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float max_entropy_scale;
+    float min_entropy_scale;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Entropic Subspace Selection
+    // Scale the gradient by the entropy of its associated subspace.
+    // Higher entropy -> higher uncertainty -> allow larger updates.
+    // Lower entropy -> established structure -> preserve with smaller updates.
+    
+    float g_val = g_in[idx];
+    float s_ent = subspace_entropy[idx]; // Proxy: pre-calculated entropy for this parameter's subspace
+    
+    // Linearly or non-linearly map entropy to a scale factor.
+    // Assuming s_ent is normalized between 0.0 and 1.0 (or we clamp it).
+    float ent_clamped = clamp(s_ent, 0.0, 1.0);
+    
+    float scale = mix(pc.min_entropy_scale, pc.max_entropy_scale, ent_clamped);
+    
+    float out_g = g_val * scale;
+    
+    g_out[idx] = out_g;
+}

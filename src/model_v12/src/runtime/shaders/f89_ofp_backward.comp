@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufDominantDir { float dominant_dir[]; }; // Single dominant direction for simplicity, can be expanded to basis
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float projection_strength;
+    float dir_norm_sq; // Pre-computed squared norm of the dominant direction
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Orthogonal Feature Projection
+    // Project gradient onto the orthogonal complement of dominant historical directions.
+    
+    float g_val = g_in[idx];
+    float d_val = dominant_dir[idx];
+    
+    // In a real implementation, we would need a reduction to compute the dot product
+    // between g_in and dominant_dir. Since we are operating element-wise here,
+    // this shader assumes the projection scalar (dot(g, d) / dot(d, d)) has been
+    // pre-computed or approximated, or we apply a local element-wise orthogonalization proxy.
+    
+    // Proxy implementation: Local penalization aligned with dominant direction
+    // If gradient aligns with dominant direction, reduce it.
+    // A true orthogonal projection requires a global dot product.
+    // For this shader, we will assume `dominant_dir` is scaled such that we subtract it
+    // proportional to the gradient's alignment (approximated locally or passed via push const).
+    
+    // If we assume `dir_norm_sq` is epsilon, we just do a simple feature suppression
+    float projection = d_val * pc.projection_strength;
+    
+    // Proxy: Subtract a portion of the dominant direction
+    float out_g = g_val - projection * g_val; 
+    
+    g_out[idx] = out_g;
+}

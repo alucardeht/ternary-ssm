@@ -1,0 +1,102 @@
+#version 450
+
+/* 
+ * v14 Clifford Algebra SSM Forward Pass
+ * This shader computes the Geometric Product for the state multivector
+ * $h_t = \exp(R_{physics} + P_{logic}) h_{t-1}$
+ */
+
+layout(local_size_x = 256) in;
+
+struct CliffordState {
+    float scalar;      /* Logic / Text */
+    float bivec_xy;    /* Vision rotor */
+    float bivec_yz;
+    float bivec_zx;
+    float spinor_r;    /* Audio phase */
+    float spinor_i;
+};
+
+layout(std430, binding = 0) readonly buffer LogicIn {
+    uint in_logic[];
+};
+
+layout(std430, binding = 1) readonly buffer AudioIn {
+    float in_audio[];
+};
+
+layout(std430, binding = 2) buffer State {
+    CliffordState h_t[];
+};
+
+/* The ternary weight tensors */
+layout(std430, binding = 3) readonly buffer WeightScalar {
+    int A_scalar[];
+};
+layout(std430, binding = 4) readonly buffer WeightBivec {
+    int A_bivec[];
+};
+layout(std430, binding = 5) readonly buffer WeightSpinor {
+    int A_spinor[];
+};
+layout(std430, binding = 6) readonly buffer WeightB {
+    int B_tensor[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint d_model;
+    uint d_state;
+    uint seq_idx;
+} pc;
+
+/* 
+ * Geometric Product stub logic:
+ * In full Cl_{3,1}, the product of multivectors mixes grades.
+ * We restrict the mixing according to the R510 invariances to prevent 
+ * Modality Collapse.
+ */
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.d_model) return;
+
+    /* 1. Fetch current multivector state */
+    CliffordState state = h_t[id];
+    
+    /* 2. Fetch input injections */
+    uint logic_val = in_logic[pc.seq_idx];
+    float audio_val = in_audio[pc.seq_idx]; /* Simplified mapping */
+
+    /* 3. Compute continuous updates (Physics) */
+    /* Spinor rotation (Audio Phase Lock) */
+    float phase_shift = audio_val * A_spinor[id];
+    float cos_p = cos(phase_shift);
+    float sin_p = sin(phase_shift);
+    
+    float new_sr = state.spinor_r * cos_p - state.spinor_i * sin_p;
+    float new_si = state.spinor_r * sin_p + state.spinor_i * cos_p;
+    
+    /* Bivector advection (Vision Navier-Stokes) */
+    /* Simplified advection step using Bivector geometric wedge */
+    float adv_xy = state.bivec_xy * float(A_bivec[id * 3 + 0]);
+    float adv_yz = state.bivec_yz * float(A_bivec[id * 3 + 1]);
+    float adv_zx = state.bivec_zx * float(A_bivec[id * 3 + 2]);
+
+    /* 4. Compute discrete updates (Logic) */
+    /* Logic runs purely on scalars. It can modulate continuous geometry but not overwrite it. */
+    float logic_delta = float(logic_val) * float(A_scalar[id]);
+    float new_scalar = state.scalar + logic_delta;
+
+    /* 5. Apply Commutator Bounding / Holonomy */
+    /* If logic demands a sharp topology shift, we reflect the bivectors without shrinking them. */
+    if (abs(logic_delta) > 1.0) {
+        adv_xy = -adv_xy; /* Discrete reflection */
+    }
+
+    /* 6. Writeback */
+    h_t[id].scalar   = new_scalar;
+    h_t[id].bivec_xy = adv_xy;
+    h_t[id].bivec_yz = adv_yz;
+    h_t[id].bivec_zx = adv_zx;
+    h_t[id].spinor_r = new_sr;
+    h_t[id].spinor_i = new_si;
+}

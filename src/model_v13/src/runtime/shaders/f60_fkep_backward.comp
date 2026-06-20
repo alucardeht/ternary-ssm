@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufVelocity { float velocity[]; };
+layout(set = 0, binding = 2) buffer BufGradOut { float g_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float penalty_scale;
+    float fractional_power;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Fractional Kinetic Energy Penalty
+    // Regularize the gradient by a fractional power of the momentum (velocity).
+    // This penalizes high-frequency oscillations without suppressing
+    // smooth, low-frequency movement as strongly as a simple L2 velocity penalty.
+    
+    float g_val = g_in[idx];
+    float v_val = velocity[idx];
+    
+    float abs_v = abs(v_val);
+    float sign_v = sign(v_val);
+    
+    // Fractional power of velocity magnitude
+    // Adding 1e-8 to avoid NaN for exactly zero
+    float fractional_v = pow(abs_v + 1e-8, pc.fractional_power);
+    
+    // The penalty opposes the direction of the velocity
+    float penalty = pc.penalty_scale * fractional_v * sign_v;
+    
+    // Apply penalty to gradient (assuming gradient descent moves param by -lr * g)
+    // To oppose velocity, we add the penalty to the gradient.
+    g_out[idx] = g_val + penalty;
+}

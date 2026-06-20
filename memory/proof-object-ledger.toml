@@ -1,0 +1,16 @@
+[meta]
+version = 1
+updated = "2026-05-20"
+purpose = "Proof objects, equations, and gates that future research must use instead of vague optimism."
+
+[split]
+generated_by = "scripts/maintenance/split_hot_memory_files.py"
+generated_at = "2026-05-22T01:28:46"
+split_shard_dir = "memory/ledgers/proof-object"
+cold_backup = ".work/context-heavy/docs-raw/2026-05-22-hot-memory-split/proof-object-ledger.toml"
+target_shard_kb = 60
+shards = [
+  "memory/ledgers/proof-object/proof-object-001.toml",
+  "memory/ledgers/proof-object/proof-object-002.toml",
+  "memory/ledgers/proof-object/proof-object-003.toml",
+]

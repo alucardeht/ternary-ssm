@@ -1,0 +1,54 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) readonly buffer Sampled { float sampled[]; };
+layout(set=0, binding=1) readonly buffer RPP { uint rpp[]; };
+layout(set=0, binding=2) readonly buffer RPN { uint rpn[]; };
+layout(set=0, binding=3) writeonly buffer PI { int pi[]; };
+layout(set=0, binding=4) writeonly buffer NI { int ni[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; };
+
+shared uint s_pc[256], s_nc[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= rows) return;
+    uint base = row * cols;
+
+    /* Contiguous chunk per thread */
+    uint chunk = (cols + 255u) / 256u;
+    uint j0 = tid * chunk;
+    uint j1 = min(j0 + chunk, cols);
+
+    /* Phase 1: count per thread */
+    uint cp = 0u, cn = 0u;
+    for (uint j = j0; j < j1; j++) {
+        float v = sampled[base + j];
+        if (v > 0.5) cp++;
+        else if (v < -0.5) cn++;
+    }
+    s_pc[tid] = cp; s_nc[tid] = cn;
+    barrier();
+
+    /* Phase 2: inclusive prefix sum (Hillis-Steele) */
+    for (uint d = 1u; d < 256u; d <<= 1u) {
+        uint vp = 0u, vn = 0u;
+        if (tid >= d) { vp = s_pc[tid - d]; vn = s_nc[tid - d]; }
+        barrier();
+        s_pc[tid] += vp; s_nc[tid] += vn;
+        barrier();
+    }
+    /* Convert to exclusive */
+    uint exc_p = (tid == 0u) ? 0u : s_pc[tid - 1u];
+    uint exc_n = (tid == 0u) ? 0u : s_nc[tid - 1u];
+
+    /* Phase 3: scatter */
+    uint pos_base = rpp[row] + exc_p;
+    uint neg_base = rpn[row] + exc_n;
+    uint pi_local = 0u, ni_local = 0u;
+    for (uint j = j0; j < j1; j++) {
+        float v = sampled[base + j];
+        if (v > 0.5) { pi[pos_base + pi_local] = int(j); pi_local++; }
+        else if (v < -0.5) { ni[neg_base + ni_local] = int(j); ni_local++; }
+    }
+}

@@ -1,0 +1,75 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufAeff { float A_eff[]; };
+layout(set = 0, binding = 1) readonly  buffer BufBeff { float B_eff[]; };
+layout(set = 0, binding = 2) readonly  buffer BufX    { float x[];     };
+layout(set = 0, binding = 3) readonly  buffer BufCbl  { float C_bl[];  };
+layout(set = 0, binding = 4) writeonly buffer BufHout { float h_out[]; };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint d_state;
+    uint has_bilinear;
+} pc;
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint b   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (tid != 0u) return;
+    if (dim >= pc.d_state) return;
+
+    uint T = pc.seq_len;
+    uint batch_base = b * T * pc.d_state;
+
+    float h_prev = 0.0;
+    uint t = 0;
+    while (t < T) {
+        uint idx = batch_base + t * pc.d_state + dim;
+        float base_x = x[idx];
+        
+        uint k = 4;
+        bool predictable = true;
+        if (t + k <= T) {
+            for (uint i = 1; i < k; i++) {
+                float next_x = x[batch_base + (t + i) * pc.d_state + dim];
+                if (abs(next_x - base_x) > 1e-4) {
+                    predictable = false;
+                    break;
+                }
+            }
+        } else {
+            predictable = false;
+        }
+
+        if (predictable) {
+            float a_sum = 0.0;
+            float bx_sum = 0.0;
+            for (uint i = 0; i < k; i++) {
+                uint cur_idx = batch_base + (t + i) * pc.d_state + dim;
+                float a = A_eff[cur_idx];
+                if (pc.has_bilinear != 0u) a += C_bl[dim] * base_x;
+                a_sum += a;
+                bx_sum += B_eff[cur_idx] * base_x;
+            }
+            // SDE Resolvent jump
+            float h_new = h_prev * exp(a_sum) + bx_sum * exp(a_sum * 0.5); 
+            
+            float h_step = (h_new - h_prev) / float(k);
+            for (uint i = 0; i < k; i++) {
+                h_out[batch_base + (t + i) * pc.d_state + dim] = h_prev + h_step * float(i + 1);
+            }
+            h_prev = h_new;
+            t += k;
+        } else {
+            float a = A_eff[idx];
+            if (pc.has_bilinear != 0u) a += C_bl[dim] * base_x;
+            float h_new = h_prev * exp(a) + B_eff[idx] * base_x;
+            h_out[idx] = h_new;
+            h_prev = h_new;
+            t += 1;
+        }
+    }
+}

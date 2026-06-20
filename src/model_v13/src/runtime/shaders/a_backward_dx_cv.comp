@@ -1,0 +1,46 @@
+#version 450
+
+/* Input-dependent A backward — d_x_cv contribution from W_A
+ *
+ * One workgroup per timestep (b, t).
+ * Dispatch: (seq_len, batch_size, 1).
+ *
+ * Each workgroup loads d_dot[t, :] into shared memory, then
+ * 128 threads (one per output dimension j) compute:
+ *   d_x_cv[t,j] += sum_i( d_dot[t,i] * W_A[i*ds + j] )
+ *
+ * This is a matrix-vector product: d_x_cv[t] += W_A^T @ d_dot[t].
+ * The += accumulates onto existing d_x_cv from prior backward passes.
+ */
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufDDot   { float d_dot[];   };
+layout(set = 0, binding = 1) readonly buffer BufWA     { float W_A[];     };
+layout(set = 0, binding = 2)          buffer BufDXcv   { float d_x_cv[];  };
+
+layout(push_constant) uniform PC {
+    uint seq_len;
+    uint ds;
+} pc;
+
+shared float s_ddot[128];
+
+void main() {
+    uint seq_idx = gl_WorkGroupID.x;
+    uint batch   = gl_WorkGroupID.y;
+    uint j       = gl_LocalInvocationID.x;
+
+    uint t = batch * pc.seq_len + seq_idx;
+
+    if (j >= pc.ds) return;
+
+    s_ddot[j] = d_dot[t * pc.ds + j];
+    barrier();
+
+    float acc = 0.0;
+    for (uint i = 0u; i < pc.ds; i++) {
+        acc += s_ddot[i] * W_A[i * pc.ds + j];
+    }
+
+    d_x_cv[t * pc.ds + j] += acc;
+}

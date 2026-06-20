@@ -1,0 +1,23 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer NodeBuf { float nodes[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint total_elements;
+    float lrms_multiplier;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total_elements) return;
+
+    // Lagrangian-Relaxed Memory Substrate (LRMS)
+    // Soft-routing continuous multiplier shifts full memory nodes to sparse residual settlement approximations
+    float val = nodes[idx];
+    if (abs(val) < lrms_multiplier) {
+        nodes[idx] = 0.0;
+    } else {
+        nodes[idx] = val - sign(val) * lrms_multiplier;
+    }
+}

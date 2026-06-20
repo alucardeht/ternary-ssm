@@ -1,0 +1,72 @@
+#version 450
+layout(local_size_x = 256) in;
+
+/* Factored first and second moment vectors (read-write) */
+layout(set = 0, binding = 0) buffer BufMRow { float m_row[]; };
+layout(set = 0, binding = 1) buffer BufMCol { float m_col[]; };
+layout(set = 0, binding = 2) buffer BufVRow { float v_row[]; };
+layout(set = 0, binding = 3) buffer BufVCol { float v_col[]; };
+
+/* Row/col gradient stats from factored_adam_reduce (as int bit patterns of float) */
+layout(set = 0, binding = 4) readonly buffer BufGRowBits  { int g_row_bits[];  };
+layout(set = 0, binding = 5) readonly buffer BufGColBits  { int g_col_bits[];  };
+layout(set = 0, binding = 6) readonly buffer BufGqRowBits { int gq_row_bits[]; };
+layout(set = 0, binding = 7) readonly buffer BufGqColBits { int gq_col_bits[]; };
+layout(set = 0, binding = 8) readonly buffer BufCntRow    { int cnt_row[];     };
+layout(set = 0, binding = 9) readonly buffer BufCntCol    { int cnt_col[];     };
+
+/* mean_v output: two float-bit accumulators.
+ * mean_v_bits[0] receives sum(v_row), mean_v_bits[1] receives sum(v_col).
+ * Host computes (sum_vr/rows)*(sum_vc/cols) for the update push constant. */
+layout(set = 0, binding = 10) buffer BufMeanVBits { int mean_v_bits[]; };
+
+layout(push_constant) uniform PC {
+    uint  rows;
+    uint  cols;
+    float beta1;
+    float beta2;
+};
+
+/* Thread i handles:
+ *   i < rows  → updates m_row[i], v_row[i]
+ *   i < rows+cols, offset cols → updates m_col[i-rows], v_col[i-rows]
+ * A single dispatch of max(rows, cols) threads covers both axes.
+ * Workgroup reduction for mean_v uses shared memory.                     */
+
+void atomicAddMean(uint slot, float delta) {
+    int expected;
+    int desired;
+    bool exchanged;
+    do {
+        expected = mean_v_bits[slot];
+        desired = floatBitsToInt(intBitsToFloat(expected) + delta);
+        int prev = atomicCompSwap(mean_v_bits[slot], expected, desired);
+        exchanged = (prev == expected);
+    } while (!exchanged);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx < rows) {
+        int cnt = cnt_row[idx];
+        float gm  = (cnt > 0) ? intBitsToFloat(g_row_bits[idx])  / float(cnt) : 0.0;
+        float gqm = (cnt > 0) ? intBitsToFloat(gq_row_bits[idx]) / float(cnt) : 0.0;
+        float new_m = beta1 * m_row[idx] + (1.0 - beta1) * gm;
+        float new_v = beta2 * v_row[idx] + (1.0 - beta2) * gqm;
+        m_row[idx] = new_m;
+        v_row[idx] = new_v;
+        atomicAddMean(0u, new_v);
+    }
+
+    if (idx < cols) {
+        int cnt = cnt_col[idx];
+        float gm  = (cnt > 0) ? intBitsToFloat(g_col_bits[idx])  / float(cnt) : 0.0;
+        float gqm = (cnt > 0) ? intBitsToFloat(gq_col_bits[idx]) / float(cnt) : 0.0;
+        float new_m = beta1 * m_col[idx] + (1.0 - beta1) * gm;
+        float new_v = beta2 * v_col[idx] + (1.0 - beta2) * gqm;
+        m_col[idx] = new_m;
+        v_col[idx] = new_v;
+        atomicAddMean(1u, new_v);
+    }
+}

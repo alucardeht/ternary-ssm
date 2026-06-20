@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufGradIn { float g_in[]; };
+layout(set = 0, binding = 1) buffer BufGradOut { float g_out[]; };
+layout(set = 0, binding = 2) buffer BufSubspaceVec { float subspace_v[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint param_size;
+    float projection_strength;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.param_size) return;
+    
+    // Hessian-Free Subspace Descent
+    // Project the gradient into a high-curvature subspace.
+    // Proxy: We assume subspace_v represents a dominant eigenvector of the local Hessian.
+    // We project the gradient onto this vector and scale it.
+    
+    float g_val = g_in[idx];
+    float v_val = subspace_v[idx];
+    
+    // In a real implementation we would compute dot(g, v) globally.
+    // As an element-wise proxy, we align g with v.
+    // If g and v align, we amplify. If orthogonal/opposing, we dampen.
+    
+    float align = g_val * v_val; // proxy for projection alignment
+    
+    float out_g = g_val;
+    if (align > 0.0) {
+        // Aligned with the high-curvature subspace
+        out_g *= (1.0 + pc.projection_strength);
+    } else {
+        // Orthogonal or opposing the high-curvature subspace
+        out_g *= (1.0 - pc.projection_strength * 0.5);
+    }
+    
+    g_out[idx] = out_g;
+}

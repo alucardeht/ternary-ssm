@@ -1,0 +1,23 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer XProj { float x_proj[]; };
+layout(set = 0, binding = 1) buffer WPred { float w_pred[]; };
+layout(set = 0, binding = 2) buffer LambdaOut { float lambda_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+    uint batch_size;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total_threads = pc.batch_size * pc.seq_len * pc.d_state;
+    if (idx >= total_threads) return;
+
+    uint d = idx % pc.d_state;
+    // synthesize cotangent using auxiliary affine predictor
+    // lambda_t = W_pred * x_t
+    lambda_out[idx] = w_pred[d] * x_proj[idx];
+}

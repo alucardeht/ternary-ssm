@@ -1,0 +1,54 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufDH { float dh[]; };
+layout(set = 0, binding = 1) readonly buffer BufDHPrev { float dh_prev[]; };
+layout(set = 0, binding = 2) buffer BufSums { float sums[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint stage; // 0 for local dot products, 1 for update
+    uint num_groups;
+    float proj_scale;
+} pc;
+
+shared float s_dot_dh_prev[256];
+shared float s_dot_prev_prev[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (pc.stage == 0u) {
+        float dot_dh_prev = 0.0;
+        float dot_prev_prev = 0.0;
+
+        if (idx < pc.N) {
+            float g = dh[idx];
+            float p = dh_prev[idx];
+            dot_dh_prev = g * p;
+            dot_prev_prev = p * p;
+        }
+
+        s_dot_dh_prev[tid] = dot_dh_prev;
+        s_dot_prev_prev[tid] = dot_prev_prev;
+        barrier();
+
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                s_dot_dh_prev[tid] += s_dot_dh_prev[tid + s];
+                s_dot_prev_prev[tid] += s_dot_prev_prev[tid + s];
+            }
+            barrier();
+        }
+
+        if (tid == 0u) {
+            sums[gl_WorkGroupID.x * 2] = s_dot_dh_prev[0];
+            sums[gl_WorkGroupID.x * 2 + 1] = s_dot_prev_prev[0];
+        }
+    } else {
+        if (idx < pc.N) {
+            dh[idx] -= pc.proj_scale * dh_prev[idx];
+        }
+    }
+}

@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufA { float A_eff[]; };
+layout(set = 0, binding = 1) buffer BufB { float B_eff[]; };
+layout(set = 0, binding = 2) buffer BufX { float x[]; };
+layout(set = 0, binding = 3) buffer BufHT { float h_T[]; };
+layout(set = 0, binding = 4) buffer BufHOut { float h_out[]; };
+
+layout(push_constant) uniform PushConsts {
+    uint seq_len;
+    uint d_state;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint batch_idx = gl_GlobalInvocationID.y;
+    if (idx >= pc.d_state) return;
+
+    // SOSE: Reconstruct Hamiltonian dynamic system recursively from h_T (Hamiltonian Adjoint)
+    // dp/dt = -dH/dq (reversible measure)
+    
+    // We start from the boundary h_T
+    uint offset = batch_idx * pc.d_state;
+    float current_h = h_T[offset + idx];
+    
+    for (int t = int(pc.seq_len) - 1; t >= 0; t--) {
+        uint t_idx = t * pc.d_state + idx;
+        // h_{t-1} = (h_t - B_t * x_t) / A_t 
+        // This is a simplified reconstruction for exact reversible measure mapping
+        float a_val = A_eff[t_idx];
+        float b_val = B_eff[t_idx];
+        float x_val = x[t * pc.d_state + idx]; // Simplified alignment
+        
+        // Inverse step
+        current_h = (current_h - b_val * x_val) / (a_val + 1e-8);
+        
+        // Store reconstructed h_t
+        h_out[t_idx] = current_h;
+    }
+}

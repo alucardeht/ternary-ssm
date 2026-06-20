@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer StateIn {
+    float state_in[];
+};
+
+layout(set = 0, binding = 1) readonly buffer KeyIn {
+    float key_in[];
+};
+
+layout(set = 0, binding = 2) buffer StateOut {
+    float state_out[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_tokens;
+    uint ds; // MUST be a power of 2
+} p;
+
+shared float shared_state[4096];
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    if (token_idx >= p.num_tokens) return;
+    
+    uint local_idx = gl_LocalInvocationID.x;
+    uint base_idx = token_idx * p.ds;
+    
+    // 1. Load previous state into shared memory
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        shared_state[i] = state_in[base_idx + i];
+    }
+    barrier();
+    
+    // 2. The Recurrence: Invertible projection via Bent-Sequence Key.
+    // Bent-sequences have a flat power spectrum. 
+    // In Hadamard space, this acts as an exact magnitude-preserving phase flip.
+    // For simplicity of this proof-of-concept, we apply a pure bitwise logic gate (sign-flip) based on the key
+    for (uint i = local_idx; i < p.ds; i += gl_WorkGroupSize.x) {
+        float s = shared_state[i];
+        float k = key_in[base_idx + i]; // Expected to be in {-1, 1}
+        
+        // Bent-Sequence multiplication preserves norm strictly.
+        // It forces the hidden state into an algebraic group.
+        state_out[base_idx + i] = s * sign(k + 1e-7);
+    }
+}

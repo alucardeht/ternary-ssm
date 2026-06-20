@@ -1,0 +1,63 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf {
+    uint data[];
+} weights;
+
+layout(set = 0, binding = 1) buffer ScratchBuf {
+    float data[];
+} scratch;
+
+layout(push_constant) uniform PushConstants {
+    uint y_off;
+    uint a_off;
+    uint b_off;
+    int n;
+    int op_type;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= uint(pc.n)) {
+        return;
+    }
+
+    uint y_base = pc.y_off / 4;
+    uint a_base = pc.a_off / 4;
+    uint b_base = pc.b_off / 4;
+
+    float a_val = scratch.data[a_base + idx];
+    float b_val = (pc.op_type > 0) ? scratch.data[b_base + idx] : 0.0;
+
+    float result;
+
+    if (pc.op_type == 0) {
+        float sigmoid_a = 1.0 / (1.0 + exp(-a_val));
+        result = a_val * sigmoid_a;
+    } else if (pc.op_type == 1) {
+        result = max(0.0, a_val);
+    } else if (pc.op_type == 2) {
+        result = a_val * b_val;
+    } else if (pc.op_type == 3 || pc.op_type == 4) {
+        result = a_val + b_val;
+    } else if (pc.op_type == 5) {
+        float sigmoid_a = 1.0 / (1.0 + exp(-a_val));
+        result = sigmoid_a * a_val * b_val;
+    } else if (pc.op_type == 6) {
+        if (a_val > 20.0) {
+            result = a_val;
+        } else if (a_val < -20.0) {
+            result = 0.0;
+        } else {
+            result = log(1.0 + exp(a_val));
+        }
+    } else {
+        result = a_val;
+    }
+
+    scratch.data[y_base + idx] = result;
+}
