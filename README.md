@@ -1,6 +1,8 @@
 # Ternary SSM Language Model
 
-> **Note — June 2026:** I'm stepping away from this research for personal reasons. This repository is the complete, unfiltered output of months of independent work — the code, the math, the papers, the dead ends, and the breakthroughs. I'm releasing everything in the hope that it may be useful to someone, somewhere. If any of this contributes to your work in any way, a citation or mention would mean a lot. — *Julio*
+> **Note — June 2026:** I stepped away from this research for personal reasons and released it as it was: the complete, unfiltered output of months of independent work — the code, the math, the papers, the dead ends, and the breakthroughs — in the hope that it may be useful to someone, somewhere. If any of this contributes to your work in any way, a citation or mention would mean a lot.
+>
+> **Update — October 2026:** I came back to it with a different question. Instead of making the ternary SSM train faster, I asked whether a model can learn far faster, with far less compute, if knowledge does not have to live in the weights at all. That led to a small brain-derived model that learns by counting and one-shot memory writes, with no trained network. It is summarized in [Continuation (October 2026)](#continuation-october-2026) and in [`memory/r508-r510-summary.md`](memory/r508-r510-summary.md); its code is not in this repository yet. Everything else here is still the June release. — *Julio*
 
 A research project exploring a novel language model architecture built from first principles: **ternary weights {-1, 0, +1}**, **State-Space Models (SSM)**, and a **custom C/Vulkan GPU training pipeline** — no PyTorch, no CUDA, no ML frameworks.
 
@@ -46,6 +48,34 @@ The project identified three fundamental barriers to training large models on co
 | **Training Time** | 🔬 Open | 60B tokens ≈ 495 days on RTX 5070. Needs paradigm shift. |
 | **Quality** | 🔬 Open | FP structural gap is 65-70%. Best closure: 89% with FP+1000 GD steps (R135) |
 
+The October continuation does not move these barriers for the ternary SSM. It is a different bet.
+
+---
+
+## Continuation (October 2026)
+
+After the release I kept testing ideas on this material (rounds R508 and R509), then opened R510 with a different approach: keep knowledge out of the weights, store each fact in one memory write, and learn the language part by counting instead of gradient descent. The design came from a study of how the brain gets away with so little compute (28 topic notes over 126 sources), turned into derivations and then into a working model, BSR (block-sparse regional). Everything ran on a laptop CPU, under 1 GB of RAM and 1 hour of training per test.
+
+What the model does:
+- reads by counting: one pass over the training sentences, one frame per clause, no gradient;
+- stores each fact in one write and answers in 0.15 ms, flat from 1k to 300k stored events;
+- consolidates offline into rules and concepts nobody stated, keeping exceptions;
+- decides by itself, after each conversation, what becomes permanent, with trust learned per source;
+- learns a new sentence form overnight from facts it already knows.
+
+Measured against my own ternary SSM reader on the same curated Portuguese grammar:
+
+| test | BSR (counting reader) | ternary SSM reader |
+|---|---|---|
+| recombination of held-out patterns, n = 9 / 18 / 36 | 0.639 / 0.843 / 0.982 | 0.317 / 0.543 / 0.754 |
+| 3 / 4 / 5 clauses with unseen words | 0.950 / 0.935 / 0.930 | 0.875 / 0.765 / 0.725 |
+| end to end on pseudo-words | 1.00 | 0.65–0.98 |
+| reader training | 0.67 s, 10,000 sentences | 26 min, 80,000 sentences |
+| operations at matched accuracy (≈ 0.95) | ≈ 2·10⁵ | ≈ 1.6·10¹¹ |
+| new sentence form overnight, from memory | 1.00 (0.08 without) | not available |
+
+Where it is not better: long sentences with known words (0.93–0.96 against 1.00) and natural sentences outside the grammar (0.22 against 0.28). There is no comparison with transformers, LLMs or public benchmarks yet. Nine independent review passes reproduced the numbers, and the model is validated within its curated grammar and ready for optimization. As far as the prior-art audit went, no published system combines all its parts, but every ingredient is known. Full claims, evidence classes and limits: [`memory/r508-r510-summary.md`](memory/r508-r510-summary.md).
+
 ---
 
 ## Repository Structure
@@ -63,16 +93,14 @@ The project identified three fundamental barriers to training large models on co
 │   ├── constructive_imagination/ # World-model substrate research
 │   └── transformer_residency/    # Transformer comparison track (standby)
 │
-├── papers/                       # Academic paper drafts (9 papers)
+├── papers/                       # Academic paper drafts (7 papers)
 │   ├── paper1-ternary-ssm/       # Core architecture paper (NeurIPS format)
 │   ├── paper2-gradient-estimators/
 │   ├── paper3-efficiency/
 │   ├── paper4-dataset-quality/
 │   ├── paper5-tssi-import/       # Ternary Sufficient-Statistic Import
 │   ├── paper6-update-objects/
-│   ├── paper7-factored-gradient-accumulation/
-│   ├── paper8-forward-only-bptt/
-│   └── paper9-jl-gradient-quotient/
+│   └── paper7-factored-gradient-accumulation/
 │
 ├── memory/                       # Research documentation
 │   ├── PROJECT-MANIFESTO.md      # Project vision and research standard
@@ -83,6 +111,7 @@ The project identified three fundamental barriers to training large models on co
 │   ├── strategic-direction.md    # Current research direction
 │   ├── project-state.md          # Development state
 │   ├── r500-summary.md           # R500 extraordinary round: 69 findings
+│   ├── r508-r510-summary.md      # October 2026 continuation: the BSR model
 │   ├── hardware-and-batch-policy.md # Hardware constraints
 │   └── historical-results.md    # Experiment history
 │
@@ -109,8 +138,8 @@ The codebase shows the full evolution from Python prototypes to native C/Vulkan:
 | v10 | C | First native prototype | Frozen |
 | v11 | Python | Production pipeline with FP+BCD+SAC | Frozen (tag `v11-final`) |
 | v12 | C/Vulkan | Pure native SSM training | Frozen baseline |
-| v13 | C/Vulkan | Ternary VSA Fractional Engine | In development |
-| v14 | C/Vulkan | Clifford Algebra SSM | Latest (active) |
+| v13 | C/Vulkan | Ternary VSA Fractional Engine | Paused (June 2026) |
+| v14 | C/Vulkan | Clifford Algebra SSM | Latest native version, paused (June 2026) |
 
 ### Building
 
@@ -156,7 +185,7 @@ Post-FP refinement on subset of layers. ~28-32% gap closure vs joint GD.
 
 ## Research Findings
 
-Over 500 research rounds were conducted, producing dozens of validated findings. The most significant from R500 (69 mechanisms, 8 paradigm-breaking):
+Over 500 research rounds were conducted before the June release. The most significant from R500 (69 mechanisms, 8 paradigm-breaking) are derivations with proofs or small checks and a projected impact; most were never implemented end to end:
 
 | Finding | Impact | Mechanism |
 |---------|--------|-----------|
@@ -210,11 +239,13 @@ See `memory/mathematical-research-map.md` for the complete mathematical architec
 - **Vulkan SDK:** Required for GPU training path
 - **RAM:** 16+ GB recommended
 
+The October continuation needs none of this: it runs on CPU only.
+
 ---
 
 ## Current State & What's Left Open
 
-This project is being released as-is — **I will not be continuing this research.** The VRAM barrier is solved, but training time and quality gaps remain open problems. If you're interested in picking any of this up, here's where things stand:
+The June release is as-is. I did not continue the ternary SSM line itself: the October continuation took the different direction described above. For the ternary SSM, the VRAM barrier is solved, but training time and quality gaps remain open problems. If you're interested in picking any of this up, here's where things stand:
 
 **What works:**
 - A complete C/Vulkan training pipeline (forward, backward, Adam optimizer, data loading, tokenizer)
@@ -281,11 +312,13 @@ Or simply mention this repository. It would mean a lot.
 
 ---
 
-## A Final Note
+## A Note
 
 This project was built entirely by one person on one GPU, driven by the belief that there has to be a fundamentally different way to train language models — not just a faster version of what already exists, but something structurally new.
 
 I don't know if the ternary SSM path is the right one. But I know the questions it asks are worth asking: Can we train without multiplications? Can we fit billions of parameters in under a gigabyte? Can a single consumer GPU do what clusters do today?
+
+In October I picked the question up again from another angle. The answer so far is small and lives on a curated grammar, but it learns in under a second what my ternary reader needed 26 minutes for, and it keeps learning while it talks. Whether that holds outside the grammar is the next question.
 
 I hope someone finds something useful here. Maybe it's a line of math that clicks, or a Vulkan shader trick, or just the conviction that the problem is worth solving differently.
 
