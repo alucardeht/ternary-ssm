@@ -1,5 +1,10 @@
 # Ternary SSM Language Model
 
+**Transformer alternatives on minimal hardware.** Two research lines, one repository:
+
+- **Ternary SSM** (June 2026 release): a {-1, 0, +1} state-space language model with a handwritten C/Vulkan training pipeline, with no PyTorch and no CUDA. Forward Programming fits 3.38B parameters in 893 MB of VRAM on one consumer GPU.
+- **BSR** (October 2026): a brain-inspired model with no trained network. It learns language by counting and stores each fact in one memory write. On its curated grammar it generalizes better than the ternary SSM reader with 4–6 orders of magnitude less compute ([summary](memory/r508-r510-summary.md)).
+
 > **Note — June 2026:** I stepped away from this research for personal reasons and released it as it was: the complete, unfiltered output of months of independent work — the code, the math, the papers, the dead ends, and the breakthroughs — in the hope that it may be useful to someone, somewhere. If any of this contributes to your work in any way, a citation or mention would mean a lot.
 >
 > **Update — October 2026:** I came back to it with a different question. Instead of making the ternary SSM train faster, I asked whether a model can learn far faster, with far less compute, if knowledge does not have to live in the weights at all. That led to a small brain-derived model that learns by counting and one-shot memory writes, with no trained network. It is summarized in [Continuation (October 2026)](#continuation-october-2026) and in [`memory/r508-r510-summary.md`](memory/r508-r510-summary.md); its code is not in this repository yet. Everything else here is still the June release. — *Julio*

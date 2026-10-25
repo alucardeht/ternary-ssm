@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use any part of this work (code, ideas, mathematical formulations or findings), please cite it as below."
+title: "Ternary State-Space Models: Hardware-Efficient Language Modeling with Custom C/Vulkan Training"
+authors:
+  - family-names: Lena
+    given-names: Julio Jose
+type: software
+repository-code: "https://github.com/alucardeht/ternary-ssm"
+url: "https://github.com/alucardeht/ternary-ssm"
+license: MIT
+version: "1.1"
+date-released: "2026-10-25"
+abstract: >-
+  Transformer alternatives on minimal hardware. A ternary {-1, 0, +1}
+  state-space language model with a handwritten C/Vulkan training pipeline
+  (no PyTorch, no CUDA) whose Forward Programming fits 3.38B parameters in
+  893 MB of VRAM, and BSR, a brain-inspired model with no trained network
+  that learns language by counting and stores each fact in one memory write.
+keywords:
+  - transformer alternative
+  - state-space models
+  - ternary neural networks
+  - matmul-free
+  - efficient language models
+  - Vulkan
+  - gradient-free learning
+  - one-shot learning
+  - continual learning
+  - brain-inspired computing
